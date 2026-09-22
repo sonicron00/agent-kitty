@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "type": "stdio",
+      "command": "../.agent-kitty/shared/bin/atlassian-mcp",
+      "args": [],
+      "tools": ["*"]
+    },
+    "lenses": {
+      "type": "stdio",
+      "command": "../.agent-kitty/shared/bin/lenses-mcp",
+      "args": [],
+      "tools": ["*"]
+    }
+  }
+}

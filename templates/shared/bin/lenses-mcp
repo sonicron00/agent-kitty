@@ -1,0 +1,10 @@
+#!/bin/zsh
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../tools/lenses-mcp" && pwd)"
+
+cd "$PROJECT_DIR"
+
+exec uv run src/lenses_mcp/server.py

@@ -1,0 +1,37 @@
+{
+  "name": "agent-kitty",
+  "version": "1.0.0",
+  "description": "Clustered agent / MCP manager",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+  "agent-kitty": "bin/agent-kitty.mjs"
+},
+"scripts": {
+  "dev:server": "tsx watch server/src/index.ts",
+  "dev:web": "npm --prefix web run dev",
+  "dev": "concurrently -k -n server,web \"npm:dev:server\" \"npm:dev:web\"",
+  "build:web": "npm --prefix web run build",
+  "build:server": "tsc -p tsconfig.server.json",
+  "build": "npm run build:web && npm run build:server",
+  "start": "node server/dist/index.js"
+},
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "express": "^5.2.1",
+    "multer": "^2.4.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^26.5.1",
+    "@types/ws": "^8.18.1",
+    "concurrently": "^10.0.5",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

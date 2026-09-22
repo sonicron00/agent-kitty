@@ -1,0 +1,27 @@
+#!/bin/zsh
+
+set -e
+
+#
+# Prefer Node 22 through NVM where available.
+# This avoids inheriting an older Node version from
+# the repository being worked on.
+#
+if [ -s "$HOME/.nvm/nvm.sh" ]; then
+    export NVM_DIR="$HOME/.nvm"
+    source "$NVM_DIR/nvm.sh"
+
+    exec nvm exec 22 npx -y mcp-remote@latest \
+        "https://mcp.atlassian.com/v2/mcp" \
+        3335 \
+        --host 127.0.0.1
+fi
+
+#
+# Fall back to the Node installation already on PATH.
+# agent-kitty doctor will eventually verify its version.
+#
+exec npx -y mcp-remote@latest \
+    "https://mcp.atlassian.com/v2/mcp" \
+    3335 \
+    --host 127.0.0.1

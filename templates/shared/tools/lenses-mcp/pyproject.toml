@@ -1,0 +1,94 @@
+[project]
+name = "lenses-mcp"
+version = "6.2.2"
+description = "Lenses.io"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastmcp==3.2.3",
+    "httpx2>=2.12",
+    "loguru>=0.7.3",
+    "python-dotenv>=1.0",
+    "typing-extensions>=4.15.0",
+    "websockets>=15.0.1",
+    # FastMCP's instrumentation is API-only; these make it actually export.
+    # HTTP exporter only -- the gRPC one pulls grpcio and adds ~27MB.
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+]
+
+[project.optional-dependencies]
+# For collectors that only accept OTLP/gRPC on 4317. Not installed by default.
+otlp-grpc = ["opentelemetry-exporter-otlp-proto-grpc>=1.30"]
+
+[dependency-groups]
+dev = [
+    # Testing
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pytest-timeout>=2.3",
+    "pytest-xdist>=3.5",
+    "httpx2>=2.12",
+
+    # Linting & formatting
+    "ruff>=0.9",
+
+    # Type checking
+    "mypy>=1.14",
+
+    # Security & compliance
+    "pip-audit>=2.10",
+    "pip-licenses>=5.5",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+    "S",    # flake8-bandit (security)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]  # Allow assert in tests
+
+[tool.ruff.lint.isort]
+known-first-party = ["lenses_mcp"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--timeout=60"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "pass",
+]
