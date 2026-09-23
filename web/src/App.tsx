@@ -180,6 +180,19 @@ function storeModel(
     }
 }
 
+    type Theme = 'light' | 'dark';
+
+    function getInitialTheme(): Theme {
+    const stored = localStorage.getItem('agent-kitty-theme');
+
+    if (stored === 'light' || stored === 'dark') {
+        return stored;
+    }
+
+    return window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light';
+    }
 
 /*
  * --------------------------------------------------------------------------
@@ -498,6 +511,7 @@ function App() {
             Record<string, boolean>
         >({});
 
+    const [theme, setTheme] = useState<Theme>(getInitialTheme);
 
     /*
      * ----------------------------------------------------------------------
@@ -564,9 +578,14 @@ function App() {
 
     /*
      * ----------------------------------------------------------------------
-     * Persist conversations
+     * Persist conversations and theme
      * ----------------------------------------------------------------------
      */
+
+    useEffect(() => {
+        document.documentElement.dataset.theme = theme;
+        localStorage.setItem('agent-kitty-theme', theme);
+        }, [theme]);
 
     useEffect(() => {
         try {
@@ -2160,6 +2179,19 @@ function App() {
                                             Default
                                         </span>
                                     )}
+                                </div>
+                                <div className="topbar-actions">
+                                    <button
+                                        type="button"
+                                        className="theme-toggle"
+                                        onClick={() =>
+                                        setTheme(current => (current === 'dark' ? 'light' : 'dark'))
+                                        }
+                                        title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+                                        aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+                                    >
+                                        {theme === 'dark' ? '☀️' : '🌙'}
+                                    </button>
                                 </div>
                             </div>
                         </header>
