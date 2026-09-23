@@ -1,4 +1,4 @@
-# Agent Kitty 🐱
+# Agent Kitty
 
 Agent Kitty is a local browser interface for running coding agents across groups of related repositories.
 
