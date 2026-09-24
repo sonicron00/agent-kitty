@@ -583,6 +583,7 @@ async function getMcpSources(
     const sharedConfigPath =
         path.join(
             COPILOT_ROOT,
+            '.agent-kitty',
             'shared',
             'mcp.json',
         );
