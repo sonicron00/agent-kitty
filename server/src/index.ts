@@ -17,6 +17,7 @@ import {
     getHarness,
     isHarnessId,
     listHarnesses,
+    loadDisabledMcpServers,
     loadHarnessId,
     saveHarnessId,
     toAcpMcpServers,
@@ -655,11 +656,27 @@ async function getAcpMcpServers(
         workspace,
     );
 
+    const disabled =
+        await loadDisabledMcpServers(
+            COPILOT_ROOT,
+            activeHarnessId,
+        );
+
+    const enabled =
+        Object.fromEntries(
+            Object.entries({
+                ...sharedServers,
+                ...workspaceServers,
+            }).filter(
+                ([name]) =>
+                    !disabled.has(
+                        name,
+                    ),
+            ),
+        );
+
     return toAcpMcpServers(
-        {
-            ...sharedServers,
-            ...workspaceServers,
-        },
+        enabled,
         workspace.path,
     );
 }
@@ -815,13 +832,23 @@ async function getWorkspaceMcpStatus(
     if (
         !agent.supportsMcpListCommand
     ) {
+        const disabled =
+            await loadDisabledMcpServers(
+                COPILOT_ROOT,
+                activeHarnessId,
+            );
+
         return [
             ...sourceByName.entries(),
         ].map(
             ([name, source]) => ({
                 name,
                 status:
-                    'configured',
+                    disabled.has(
+                        name,
+                    )
+                        ? 'disabled'
+                        : 'configured',
                 source,
             }),
         );

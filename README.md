@@ -1166,6 +1166,18 @@ Codex notes:
 - Codex reads `AGENTS.md` from the workspace directory natively.
 - Relative MCP commands such as `../.agent-kitty/shared/bin/lenses-mcp` are resolved against the workspace directory.
 - The MCPs tab shows Codex servers as `configured`, because Codex has no parseable `/mcp list` equivalent over ACP.
+- To withhold MCP servers from a harness, list them in `.agent-kitty/config.json`. They show as `disabled` in the MCPs tab and apply from the next agent start (switch harness or restart Agent Kitty):
+
+  ```json
+  {
+    "version": 1,
+    "disabledMcpServers": {
+      "codex": ["lenses", "netsuite"]
+    }
+  }
+  ```
+
+  This only affects harnesses that receive MCP servers over ACP (Codex). Copilot loads `mcp.json` itself.
 - Set `AGENT_KITTY_CODEX_ACP` to use a different `codex-acp` executable.
 
 ---

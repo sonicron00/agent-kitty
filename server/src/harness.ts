@@ -261,6 +261,35 @@ export async function loadHarnessId(
         : DEFAULT_HARNESS;
 }
 
+/*
+ * MCP server names to withhold from a harness, from
+ * config.json "disabledMcpServers": { "<harness>": ["name"] }.
+ * Only applies to harnesses that receive MCP servers over ACP.
+ */
+export async function loadDisabledMcpServers(
+    root: string,
+    id: HarnessId,
+): Promise<Set<string>> {
+    const config = await readConfig(root);
+
+    const byHarness = config.disabledMcpServers;
+
+    if (!byHarness || typeof byHarness !== 'object') {
+        return new Set();
+    }
+
+    const names = (byHarness as Record<string, unknown>)[id];
+
+    return new Set(
+        Array.isArray(names)
+            ? names.filter(
+                  (name): name is string =>
+                      typeof name === 'string',
+              )
+            : [],
+    );
+}
+
 export async function saveHarnessId(
     root: string,
     id: HarnessId,
