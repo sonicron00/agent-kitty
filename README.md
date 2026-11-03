@@ -2,9 +2,9 @@
 
 Agent Kitty is a local browser interface for running coding agents across groups of related repositories.
 
-The current release uses the GitHub Copilot CLI as its agent runtime.
+Agent Kitty can run on more than one agent **harness**: GitHub Copilot CLI (default) or OpenAI Codex. Switch between them from the **Harness** selector in the sidebar; the choice applies to every agent and is remembered between restarts. See [Harnesses](#harnesses).
 
-Instead of opening one repository at a time, Agent Kitty lets you create an **agent workspace** containing several repositories that belong together. Each agent gets its own instructions, MCP configuration, Copilot session, model selection, reasoning setting, conversation history, and tool activity.
+Instead of opening one repository at a time, Agent Kitty lets you create an **agent workspace** containing several repositories that belong together. Each agent gets its own instructions, MCP configuration, agent session, model selection, reasoning setting, conversation history, and tool activity.
 
 ---
 
@@ -12,7 +12,8 @@ Instead of opening one repository at a time, Agent Kitty lets you create an **ag
 
 Agent Kitty gives you:
 
-- A browser UI for GitHub Copilot coding agents
+- A browser UI for GitHub Copilot and OpenAI Codex coding agents
+- One-click harness switching across all agents
 - Multiple independent agents in one interface
 - Support for grouping related repositories together
 - Streaming responses
@@ -240,8 +241,8 @@ Agent Kitty currently expects:
 - Node.js 22 or newer
 - Git
 - zsh
-- GitHub Copilot CLI
-- GitHub Copilot CLI authentication
+- GitHub Copilot CLI and authentication (for the Copilot harness)
+- OpenAI Codex authentication (for the Codex harness; the adapter is bundled)
 - `npx`
 - `uv` if using the bundled Lenses MCP
 
@@ -264,6 +265,11 @@ Prerequisites
 ✓ zsh
 ✓ npx
 ✓ uv
+
+Harnesses
+
+✓ Codex ACP adapter
+✓ Codex authentication
 
 Agent Kitty setup
 
@@ -1125,6 +1131,43 @@ Then run:
 agent-kitty doctor
 ```
 
+### Codex does not start or cannot reach OpenAI
+
+Codex needs to reach `chatgpt.com` (ChatGPT sign-in) or `api.openai.com` (API key). A corporate proxy, VPN or firewall that blocks these shows as "workspace routing discovery failed" in the chat.
+
+Sign in with:
+
+```bash
+npx codex login
+```
+
+or export `OPENAI_API_KEY` before `agent-kitty start`.
+
+---
+
+## Harnesses
+
+A harness is the coding agent runtime behind every agent. Agent Kitty talks to each one over the Agent Client Protocol (ACP).
+
+| Harness | How it runs | MCP servers |
+|---|---|---|
+| GitHub Copilot (default) | The workspace `start` script (`copilot --acp --stdio`) | Loaded by Copilot from `--additional-mcp-config` |
+| OpenAI Codex | Bundled `@agentclientprotocol/codex-acp` adapter | Shared and workspace `mcp.json` passed over ACP |
+
+Switching harness:
+
+- Use the **Harness** selector in the sidebar. It is disabled while any agent is working.
+- Every running agent process is stopped and restarts on the new harness at its next request. Conversation history in the UI is kept, but the new harness starts a fresh session without the previous context.
+- The choice is saved as `"harness"` in `.agent-kitty/config.json`. `AGENT_KITTY_HARNESS=codex agent-kitty start` overrides it for one run.
+- Model choices are remembered per harness.
+
+Codex notes:
+
+- Codex reads `AGENTS.md` from the workspace directory natively.
+- Relative MCP commands such as `../.agent-kitty/shared/bin/lenses-mcp` are resolved against the workspace directory.
+- The MCPs tab shows Codex servers as `configured`, because Codex has no parseable `/mcp list` equivalent over ACP.
+- Set `AGENT_KITTY_CODEX_ACP` to use a different `codex-acp` executable.
+
 ---
 
 ## Development
@@ -1185,12 +1228,12 @@ Agent Kitty Node backend
    ↓
 Agent Client Protocol
    ↓
-GitHub Copilot CLI
+Harness: GitHub Copilot CLI or OpenAI Codex (codex-acp)
    ↓
 Repositories + AGENTS.md + MCP servers
 ```
 
-Each Agent Kitty workspace has an independent Copilot process/session.
+Each Agent Kitty workspace has an independent agent process/session on the active harness.
 
 This allows multiple agents to work independently from the same browser interface.
 

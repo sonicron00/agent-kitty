@@ -4,8 +4,9 @@ import {
     type ChildProcessWithoutNullStreams,
 } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+
+import type { HarnessDefinition } from './harness.js';
 
 export type PromptResult = {
     response: string;
@@ -85,10 +86,69 @@ export class WorkspaceAgent {
 
     private busy = false;
 
+    private stopped = false;
+
     constructor(
         private readonly workspacePath: string,
         private readonly workspaceName: string,
+        private readonly harness: HarnessDefinition,
+        private readonly loadMcpServers: () => Promise<any[]>,
     ) {}
+
+    get harnessId(): string {
+        return this.harness.id;
+    }
+
+    get supportsMcpListCommand(): boolean {
+        return this.harness.supportsMcpListCommand;
+    }
+
+    isBusy(): boolean {
+        return this.busy;
+    }
+
+    stop(): void {
+        this.stopped = true;
+
+        for (const resolver of this.pendingPermissions.values()) {
+            resolver({ outcome: { outcome: 'cancelled' } });
+        }
+
+        this.pendingPermissions.clear();
+
+        const child = this.process;
+
+        this.process = null;
+        this.connection = null;
+        this.sessionId = null;
+
+        if (child && child.exitCode === null) {
+            child.kill('SIGTERM');
+
+            setTimeout(() => {
+                if (child.exitCode === null) {
+                    child.kill('SIGKILL');
+                }
+            }, 3000).unref();
+        }
+    }
+
+    private async sessionMcpServers(): Promise<any[]> {
+        if (!this.harness.mcpViaAcp) {
+            return [];
+        }
+
+        try {
+            return await this.loadMcpServers();
+        } catch (error) {
+            console.error(
+                `[${this.workspaceName}] Unable to load MCP servers`,
+                error,
+            );
+
+            return [];
+        }
+    }
 
     private updateReasoningState(
     configOptions: any[] | undefined,
@@ -269,13 +329,13 @@ async setReasoning(
 
     if (!this.reasoningConfigId) {
         throw new Error(
-            'This Copilot session does not expose configurable reasoning',
+            `This ${this.harness.label} session does not expose configurable reasoning`,
         );
     }
 
     if (this.busy) {
         throw new Error(
-            'Cannot change reasoning while Copilot is working',
+            `Cannot change reasoning while ${this.harness.label} is working`,
         );
     }
 
@@ -327,13 +387,13 @@ async setModel(
 
     if (!this.modelConfigId) {
         throw new Error(
-            'Copilot did not advertise a model selector',
+            `${this.harness.label} did not advertise a model selector`,
         );
     }
 
     if (this.busy) {
         throw new Error(
-            'Cannot change model while Copilot is working',
+            `Cannot change model while ${this.harness.label} is working`,
         );
     }
 
@@ -396,22 +456,57 @@ private async startInternal(): Promise<void> {
             return;
         }
 
-        const startScript = path.join(
+        if (this.stopped) {
+            throw new Error(
+                `${this.workspaceName} agent was stopped`,
+            );
+        }
+
+        const launch = this.harness.launch(
             this.workspacePath,
-            'start',
         );
 
         const copilotProcess = spawn(
-            startScript,
-            ['--acp', '--stdio'],
+            launch.command,
+            launch.args,
             {
                 cwd: this.workspacePath,
-                env: process.env,
+                env: {
+                    ...process.env,
+                    ...launch.env,
+                },
                 stdio: ['pipe', 'pipe', 'pipe'],
             },
         );
 
         this.process = copilotProcess;
+
+        const spawnFailed = new Promise<never>(
+            (_resolve, reject) => {
+                copilotProcess.once('error', (error) => {
+                    console.error(
+                        `[${this.workspaceName}] Unable to start ${this.harness.label}`,
+                        error,
+                    );
+
+                    reject(
+                        new Error(
+                            `Unable to start ${this.harness.label}: ${error.message}`,
+                        ),
+                    );
+                });
+
+                copilotProcess.once('exit', (code, signal) => {
+                    reject(
+                        new Error(
+                            `${this.harness.label} exited during startup (code ${code}, signal ${signal})`,
+                        ),
+                    );
+                });
+            },
+        );
+
+        spawnFailed.catch(() => undefined);
 
         copilotProcess.stderr.on('data', (data) => {
             const text = data.toString().trim();
@@ -425,9 +520,13 @@ private async startInternal(): Promise<void> {
 
         copilotProcess.on('exit', (code, signal) => {
             console.log(
-                `[${this.workspaceName}] Copilot exited`,
+                `[${this.workspaceName}] ${this.harness.label} exited`,
                 { code, signal },
             );
+
+            if (this.process !== copilotProcess) {
+                return;
+            }
 
             this.process = null;
             this.connection = null;
@@ -603,16 +702,43 @@ private async startInternal(): Promise<void> {
 
         this.connection = connection;
 
-        await connection.initialize({
-            protocolVersion: acp.PROTOCOL_VERSION,
-            clientCapabilities: {},
-        });
+        let session: acp.NewSessionResponse;
 
-        const session =
-            await connection.newSession({
-                cwd: this.workspacePath,
-                mcpServers: [],
-            });
+        try {
+            session = await Promise.race([
+                spawnFailed,
+                (async () => {
+                    await connection.initialize({
+                        protocolVersion: acp.PROTOCOL_VERSION,
+                        clientCapabilities: {},
+                    });
+
+                    return await connection.newSession({
+                        cwd: this.workspacePath,
+                        mcpServers:
+                            await this.sessionMcpServers(),
+                    });
+                })(),
+            ]);
+        } catch (error) {
+            if (this.process === copilotProcess) {
+                this.process = null;
+                this.connection = null;
+                this.sessionId = null;
+            }
+
+            if (copilotProcess.exitCode === null) {
+                copilotProcess.kill('SIGTERM');
+            }
+
+            throw error;
+        }
+
+        if (this.process !== copilotProcess) {
+            throw new Error(
+                `${this.workspaceName} agent was stopped during startup`,
+            );
+        }
 
         this.sessionId = session.sessionId;
 
@@ -718,7 +844,8 @@ async resetSession(): Promise<void> {
     const session =
         await this.connection.newSession({
             cwd: this.workspacePath,
-            mcpServers: [],
+            mcpServers:
+                await this.sessionMcpServers(),
         });
 
     this.sessionId =

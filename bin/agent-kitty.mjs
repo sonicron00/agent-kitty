@@ -18,6 +18,7 @@ import {
     readFileSync,
 } from 'node:fs';
 
+import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -917,6 +918,68 @@ Prerequisites
             result.output,
         );
     }
+
+    /*
+     * Harnesses
+     */
+    console.log(
+        '\nHarnesses\n',
+    );
+
+    const codexAdapter =
+        path.join(
+            packageRoot,
+            'node_modules',
+            '@agentclientprotocol',
+            'codex-acp',
+            'dist',
+            'index.js',
+        );
+
+    const codexAdapterFound =
+        Boolean(
+            process.env
+                .AGENT_KITTY_CODEX_ACP,
+        ) ||
+        existsSync(
+            codexAdapter,
+        );
+
+    printCheck(
+        codexAdapterFound,
+        'Codex ACP adapter',
+        codexAdapterFound
+            ? ''
+            : 'Run "npm install" in the agent-kitty package',
+    );
+
+    const codexHome =
+        process.env.CODEX_HOME ??
+        path.join(
+            os.homedir(),
+            '.codex',
+        );
+
+    const codexSignedIn =
+        Boolean(
+            process.env.CODEX_API_KEY ||
+                process.env
+                    .OPENAI_API_KEY,
+        ) ||
+        existsSync(
+            path.join(
+                codexHome,
+                'auth.json',
+            ),
+        );
+
+    printCheck(
+        codexSignedIn,
+        'Codex authentication',
+        codexSignedIn
+            ? ''
+            : 'Run "npx codex login" or set OPENAI_API_KEY',
+    );
 
     /*
      * Agent Kitty root

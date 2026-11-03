@@ -105,6 +105,19 @@ type ReasoningState = {
 type WorkspaceActivities =
     Record<string, ToolActivity[]>;
 
+type HarnessSummary = {
+    id: string;
+    label: string;
+    description: string;
+    available: boolean;
+    detail?: string;
+};
+
+type HarnessState = {
+    current: string;
+    harnesses: HarnessSummary[];
+};
+
 type Conversations =
     Record<string, Message[]>;
 
@@ -141,12 +154,28 @@ function loadStoredConversations():
     }
 }
 
-function getStoredModels():
+/*
+ * Model ids differ per harness, so each harness keeps
+ * its own map. Copilot keeps the original key.
+ */
+function modelsStorageKey(
+    harnessId: string,
+): string {
+    return harnessId === 'copilot'
+        ? MODELS_STORAGE_KEY
+        : `${MODELS_STORAGE_KEY}-${harnessId}`;
+}
+
+function getStoredModels(
+    harnessId: string,
+):
     Record<string, string> {
     try {
         const stored =
             localStorage.getItem(
-                MODELS_STORAGE_KEY,
+                modelsStorageKey(
+                    harnessId,
+                ),
             );
 
         return stored
@@ -158,18 +187,23 @@ function getStoredModels():
 }
 
 function storeModel(
+    harnessId: string,
     workspaceId: string,
     modelId: string,
 ): void {
     try {
         const stored =
-            getStoredModels();
+            getStoredModels(
+                harnessId,
+            );
 
         stored[workspaceId] =
             modelId;
 
         localStorage.setItem(
-            MODELS_STORAGE_KEY,
+            modelsStorageKey(
+                harnessId,
+            ),
             JSON.stringify(stored),
         );
     } catch (error) {
@@ -513,6 +547,34 @@ function App() {
 
     const [theme, setTheme] = useState<Theme>(getInitialTheme);
 
+    const [
+        harnessState,
+        setHarnessState,
+    ] = useState<HarnessState | null>(
+        null,
+    );
+
+    const [
+        switchingHarness,
+        setSwitchingHarness,
+    ] = useState(false);
+
+    const harnessId =
+        harnessState?.current ??
+        null;
+
+    const harnessLabel =
+        harnessState?.harnesses.find(
+            (harness) =>
+                harness.id ===
+                harnessState.current,
+        )?.label ?? 'Agent';
+
+    const anySending =
+        Object.values(
+            sendingByWorkspace,
+        ).some(Boolean);
+
     /*
      * ----------------------------------------------------------------------
      * Derived state
@@ -652,17 +714,132 @@ function App() {
 
     /*
      * ----------------------------------------------------------------------
+     * Harness (global across all agents)
+     * ----------------------------------------------------------------------
+     */
+
+    useEffect(() => {
+        async function loadHarness() {
+            try {
+                const response =
+                    await fetch(
+                        '/api/harness',
+                    );
+
+                const data =
+                    await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        data.error ??
+                            'Unable to load harness',
+                    );
+                }
+
+                setHarnessState(
+                    data as HarnessState,
+                );
+            } catch (error) {
+                setError(
+                    error instanceof Error
+                        ? error.message
+                        : 'Unable to load harness',
+                );
+            }
+        }
+
+        loadHarness();
+    }, []);
+
+    async function changeHarness(
+        nextHarnessId: string,
+    ) {
+        if (
+            !harnessState ||
+            nextHarnessId ===
+                harnessState.current
+        ) {
+            return;
+        }
+
+        setSwitchingHarness(true);
+        setError(null);
+
+        try {
+            const response =
+                await fetch(
+                    '/api/harness',
+                    {
+                        method:
+                            'POST',
+
+                        headers: {
+                            'Content-Type':
+                                'application/json',
+                        },
+
+                        body:
+                            JSON.stringify({
+                                harness:
+                                    nextHarnessId,
+                            }),
+                    },
+                );
+
+            const data =
+                await response.json();
+
+            if (!response.ok) {
+                throw new Error(
+                    data.error ??
+                        'Unable to switch harness',
+                );
+            }
+
+            /*
+             * Every agent restarts on the new
+             * harness, so drop per-session state.
+             */
+            setModelsByWorkspace({});
+            setReasoningByWorkspace({});
+            setMcpsByWorkspace({});
+            setPendingPermissions({});
+            setActivities({});
+
+            setHarnessState(
+                data as HarnessState,
+            );
+        } catch (error) {
+            setError(
+                error instanceof Error
+                    ? error.message
+                    : 'Unable to switch harness',
+            );
+        } finally {
+            setSwitchingHarness(false);
+        }
+    }
+
+
+    /*
+     * ----------------------------------------------------------------------
      * Load model options and restore persisted model
      * ----------------------------------------------------------------------
      */
 
     useEffect(() => {
-        if (!selectedId) {
+        if (
+            !selectedId ||
+            !harnessId
+        ) {
             return;
         }
 
         const workspaceId =
             selectedId;
+
+        const activeHarnessId =
+            harnessId;
 
         async function loadModels() {
             try {
@@ -685,7 +862,9 @@ function App() {
                 }
 
                 const storedModels =
-                    getStoredModels();
+                    getStoredModels(
+                        activeHarnessId,
+                    );
 
                 const storedModel =
                     storedModels[
@@ -776,7 +955,7 @@ function App() {
         }
 
         loadModels();
-    }, [selectedId]);
+    }, [selectedId, harnessId]);
 
 
     /*
@@ -786,7 +965,10 @@ function App() {
      */
 
     useEffect(() => {
-        if (!selectedId) {
+        if (
+            !selectedId ||
+            !harnessId
+        ) {
             return;
         }
 
@@ -831,7 +1013,7 @@ function App() {
         }
 
         loadReasoning();
-    }, [selectedId]);
+    }, [selectedId, harnessId]);
 
 
     /*
@@ -1007,6 +1189,7 @@ function App() {
             workspaceView !==
                 'mcps' ||
             !selectedId ||
+            !harnessId ||
             mcpsByWorkspace[
                 selectedId
             ] !== undefined
@@ -1020,6 +1203,7 @@ function App() {
     }, [
         workspaceView,
         selectedId,
+        harnessId,
         mcpsByWorkspace,
     ]);
 
@@ -1294,10 +1478,13 @@ function App() {
                 }),
             );
 
-            storeModel(
-                workspaceId,
-                modelId,
-            );
+            if (harnessId) {
+                storeModel(
+                    harnessId,
+                    workspaceId,
+                    modelId,
+                );
+            }
         } catch (error) {
             setError(
                 error instanceof Error
@@ -1557,7 +1744,7 @@ function App() {
                                     event.text;
 
                                 /*
-                                 * Copilot sometimes resumes
+                                 * The agent sometimes resumes
                                  * immediately after a tool call
                                  * without whitespace.
                                  */
@@ -1643,7 +1830,7 @@ function App() {
         ) {
             throw new Error(
                 event.error ??
-                    'Copilot returned an error',
+                    `${harnessLabel} returned an error`,
             );
         }
     }
@@ -1960,6 +2147,68 @@ function App() {
                     />
                 </div>
 
+                <div className="harness-picker">
+                    <label htmlFor="harness">
+                        Harness
+                    </label>
+
+                    {harnessState ? (
+                        <select
+                            id="harness"
+                            value={
+                                harnessState.current
+                            }
+                            disabled={
+                                anySending ||
+                                switchingHarness
+                            }
+                            title={
+                                anySending
+                                    ? 'Wait for agents to finish before switching'
+                                    : 'Applies to every agent'
+                            }
+                            onChange={(
+                                event,
+                            ) =>
+                                changeHarness(
+                                    event
+                                        .target
+                                        .value,
+                                )
+                            }
+                        >
+                            {harnessState.harnesses.map(
+                                (
+                                    harness,
+                                ) => (
+                                    <option
+                                        key={
+                                            harness.id
+                                        }
+                                        value={
+                                            harness.id
+                                        }
+                                        disabled={
+                                            !harness.available &&
+                                            harness.id !==
+                                                harnessState.current
+                                        }
+                                    >
+                                        {harness.label}
+                                        {harness.available
+                                            ? ''
+                                            : ` (${harness.detail ?? 'unavailable'})`}
+                                    </option>
+                                ),
+                            )}
+                        </select>
+                    ) : (
+                        <span className="model-loading">
+                            Loading…
+                        </span>
+                    )}
+                </div>
+
                 <div className="sidebar-heading">
                     Agents
                 </div>
@@ -2069,6 +2318,9 @@ function App() {
                                     {sending
                                         ? 'Working'
                                         : 'Ready'}
+                                    {harnessState
+                                        ? ` · ${harnessLabel}`
+                                        : ''}
                                 </span>
                             </div>
 
@@ -2858,7 +3110,7 @@ function App() {
                                     <div className="mcp-sections">
                                         <McpGroup
                                             title="Built-in"
-                                            description="Provided directly by GitHub Copilot."
+                                            description={`Provided directly by ${harnessLabel}.`}
                                             servers={mcpsByWorkspace[
                                                 selectedWorkspace
                                                     .id
@@ -2879,7 +3131,7 @@ function App() {
 
                                         <McpGroup
                                             title="Shared"
-                                            description="Available across Copilot workspaces."
+                                            description="Available across all agents."
                                             servers={mcpsByWorkspace[
                                                 selectedWorkspace
                                                     .id

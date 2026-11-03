@@ -5,21 +5,22 @@
   "main": "index.js",
   "type": "module",
   "bin": {
-  "agent-kitty": "bin/agent-kitty.mjs"
-},
-"scripts": {
-  "dev:server": "tsx watch server/src/index.ts",
-  "dev:web": "npm --prefix web run dev",
-  "dev": "concurrently -k -n server,web \"npm:dev:server\" \"npm:dev:web\"",
-  "build:web": "npm --prefix web run build",
-  "build:server": "tsc -p tsconfig.server.json",
-  "build": "npm run build:web && npm run build:server",
-  "start": "node server/dist/index.js"
-},
+    "agent-kitty": "bin/agent-kitty.mjs"
+  },
+  "scripts": {
+    "dev:server": "tsx watch server/src/index.ts",
+    "dev:web": "npm --prefix web run dev",
+    "dev": "concurrently -k -n server,web \"npm:dev:server\" \"npm:dev:web\"",
+    "build:web": "npm --prefix web run build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build": "npm run build:web && npm run build:server",
+    "start": "node server/dist/index.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@agentclientprotocol/codex-acp": "^2.5.0",
     "@agentclientprotocol/sdk": "^1.4.0",
     "express": "^5.2.1",
     "multer": "^2.4.0",

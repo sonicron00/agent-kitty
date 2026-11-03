@@ -13,6 +13,15 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import { WorkspaceAgent } from './WorkspaceAgent.js';
+import {
+    getHarness,
+    isHarnessId,
+    listHarnesses,
+    loadHarnessId,
+    saveHarnessId,
+    toAcpMcpServers,
+    type HarnessId,
+} from './harness.js';
 
 
 /*
@@ -40,6 +49,16 @@ const agents =
         string,
         WorkspaceAgent
     >();
+
+/*
+ * The active harness is global: every agent runs on
+ * the same one, and the choice persists in
+ * .agent-kitty/config.json.
+ */
+let activeHarnessId: HarnessId =
+    await loadHarnessId(
+        COPILOT_ROOT,
+    );
 
 const execFileAsync =
     promisify(execFile);
@@ -285,6 +304,13 @@ function getOrCreateAgent(
         new WorkspaceAgent(
             workspace.path,
             workspace.name,
+            getHarness(
+                activeHarnessId,
+            ),
+            () =>
+                getAcpMcpServers(
+                    workspace,
+                ),
         );
 
     agents.set(
@@ -575,11 +601,12 @@ async function readMcpConfig(
     }
 }
 
-async function getMcpSources(
+async function readWorkspaceMcpConfigs(
     workspace: Workspace,
-): Promise<
-    Map<string, McpSource>
-> {
+): Promise<{
+    sharedServers: Record<string, unknown>;
+    workspaceServers: Record<string, unknown>;
+}> {
     const sharedConfigPath =
         path.join(
             COPILOT_ROOT,
@@ -606,6 +633,48 @@ async function getMcpSources(
             workspaceConfigPath,
         ),
     ]);
+
+    return {
+        sharedServers,
+        workspaceServers,
+    };
+}
+
+/*
+ * Shared plus workspace servers in ACP form, for
+ * harnesses that receive MCP servers over ACP.
+ * Workspace entries win on a name clash.
+ */
+async function getAcpMcpServers(
+    workspace: Workspace,
+): Promise<any[]> {
+    const {
+        sharedServers,
+        workspaceServers,
+    } = await readWorkspaceMcpConfigs(
+        workspace,
+    );
+
+    return toAcpMcpServers(
+        {
+            ...sharedServers,
+            ...workspaceServers,
+        },
+        workspace.path,
+    );
+}
+
+async function getMcpSources(
+    workspace: Workspace,
+): Promise<
+    Map<string, McpSource>
+> {
+    const {
+        sharedServers,
+        workspaceServers,
+    } = await readWorkspaceMcpConfigs(
+        workspace,
+    );
 
     const sourceByName =
         new Map<
@@ -739,6 +808,25 @@ async function getWorkspaceMcpStatus(
             workspace,
         );
 
+    /*
+     * Harnesses without a parseable "/mcp list"
+     * report the servers agent-kitty hands them.
+     */
+    if (
+        !agent.supportsMcpListCommand
+    ) {
+        return [
+            ...sourceByName.entries(),
+        ].map(
+            ([name, source]) => ({
+                name,
+                status:
+                    'configured',
+                source,
+            }),
+        );
+    }
+
     const output =
         await agent.getMcpStatusText();
 
@@ -747,6 +835,143 @@ async function getWorkspaceMcpStatus(
         sourceByName,
     );
 }
+
+
+/*
+ * --------------------------------------------------------------------------
+ * Harness
+ * --------------------------------------------------------------------------
+ */
+
+function harnessResponse() {
+    return {
+        current:
+            activeHarnessId,
+        harnesses:
+            listHarnesses(),
+    };
+}
+
+app.get(
+    '/api/harness',
+    (_req, res) => {
+        res.json(
+            harnessResponse(),
+        );
+    },
+);
+
+app.post(
+    '/api/harness',
+    async (req, res) => {
+        try {
+            const requested =
+                req.body?.harness;
+
+            if (
+                !isHarnessId(
+                    requested,
+                )
+            ) {
+                res.status(
+                    400,
+                ).json({
+                    error:
+                        `Unknown harness: ${String(requested)}`,
+                });
+
+                return;
+            }
+
+            if (
+                requested ===
+                activeHarnessId
+            ) {
+                res.json(
+                    harnessResponse(),
+                );
+
+                return;
+            }
+
+            const availability =
+                getHarness(
+                    requested,
+                ).availability();
+
+            if (
+                !availability.available
+            ) {
+                res.status(
+                    400,
+                ).json({
+                    error:
+                        `${getHarness(requested).label} is not available: ${availability.detail ?? 'unknown reason'}`,
+                });
+
+                return;
+            }
+
+            const busy =
+                [
+                    ...agents.values(),
+                ].some(
+                    (agent) =>
+                        agent.isBusy(),
+                );
+
+            if (busy) {
+                res.status(
+                    409,
+                ).json({
+                    error:
+                        'An agent is still working. Wait for it to finish before switching harness.',
+                });
+
+                return;
+            }
+
+            await saveHarnessId(
+                COPILOT_ROOT,
+                requested,
+            );
+
+            activeHarnessId =
+                requested;
+
+            for (
+                const agent of
+                agents.values()
+            ) {
+                agent.stop();
+            }
+
+            agents.clear();
+
+            console.log(
+                `Harness switched to ${requested}`,
+            );
+
+            res.json(
+                harnessResponse(),
+            );
+        } catch (error) {
+            console.error(
+                error,
+            );
+
+            res.status(
+                500,
+            ).json({
+                error:
+                    errorMessage(
+                        error,
+                        'Unable to switch harness',
+                    ),
+            });
+        }
+    },
+);
 
 
 /*
@@ -762,6 +987,8 @@ app.get(
             status: 'ok',
             copilotRoot:
                 COPILOT_ROOT,
+            harness:
+                activeHarnessId,
         });
     },
 );
