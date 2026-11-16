@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../agent-manager"
+		},
+		{
+			"path": "../../company-ai-cli"
+		},
+		{
+			"path": "../../ai/agent-manager"
+		}
+	],
+	"settings": {}
+}

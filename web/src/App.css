@@ -242,8 +242,66 @@ textarea {
     resize: none;
     outline: none;
     min-height: 50px;
+    max-height: 70vh;
     padding: 8px;
     background: transparent;
+}
+
+.composer {
+    position: relative;
+}
+
+.composer-resize-handle {
+    position: absolute;
+    top: -6px;
+    left: 16px;
+    right: 16px;
+    height: 12px;
+    cursor: ns-resize;
+    touch-action: none;
+    z-index: 1;
+}
+
+.composer-resize-handle::after {
+    content: '';
+    position: absolute;
+    top: 4px;
+    left: 50%;
+    width: 40px;
+    height: 4px;
+    margin-left: -20px;
+    border-radius: 999px;
+    background: #cfcfcf;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.composer:hover .composer-resize-handle::after,
+.composer-resize-handle:hover::after,
+body.resizing-composer .composer-resize-handle::after {
+    opacity: 1;
+}
+
+body.resizing-composer {
+    cursor: ns-resize;
+    user-select: none;
+}
+
+.message-handoff {
+    margin-bottom: 6px;
+    font-size: 11px;
+    color: #8a6d00;
+}
+
+:root[data-theme="dark"] .message-handoff {
+    color: #d4b04a;
+}
+
+.message-usage {
+    margin-top: 8px;
+    font-size: 11px;
+    color: #999;
+    font-variant-numeric: tabular-nums;
 }
 
 .composer > button[type="submit"] {
@@ -295,6 +353,8 @@ textarea {
     background: #f1f1f1;
     border-radius: 16px;
     padding: 12px 16px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }
 
 .message.assistant .message-content {
@@ -1564,6 +1624,14 @@ textarea {
     color: #919197;
 }
 
+:root[data-theme="dark"] .message-usage {
+    color: #6f6f75;
+}
+
+:root[data-theme="dark"] .composer-resize-handle::after {
+    background: #4a4a50;
+}
+
 :root[data-theme="dark"] .message.user .message-content {
     background: #29292f;
     color: #f1f1f3;
@@ -1946,3 +2014,217 @@ textarea {
     color: #ffffff;
 }
 
+
+
+/* Harness picker (sidebar, global across agents) */
+
+.harness-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 9px 20px;
+}
+
+.harness-picker label {
+    color: #8e8e8e;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.harness-picker select {
+    width: 100%;
+    border: 1px solid #d6d6d6;
+    border-radius: 8px;
+    background: white;
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+}
+
+.harness-picker select:hover:not(:disabled) {
+    border-color: #aaa;
+}
+
+.harness-picker select:disabled {
+    opacity: 0.6;
+}
+
+:root[data-theme="dark"] .harness-picker select {
+    border-color: #3a3a3f;
+    background: #1c1c20;
+    color: #f1f1f3;
+}
+
+:root[data-theme="dark"] .harness-picker select:hover:not(:disabled) {
+    border-color: #56565d;
+}
+
+.account-group {
+    margin-top: 4px;
+}
+
+.account-group > summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 0;
+    color: #8e8e8e;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+}
+
+.account-group > summary::-webkit-details-marker {
+    display: none;
+}
+
+.account-group > summary::before {
+    content: "▸";
+    font-size: 10px;
+    transition: transform 0.15s ease;
+}
+
+.account-group[open] > summary::before {
+    transform: rotate(90deg);
+}
+
+.account-group > summary:hover {
+    color: #555;
+}
+
+:root[data-theme="dark"] .account-group > summary:hover {
+    color: #c8c8cc;
+}
+
+.account-group-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 6px 0 0 4px;
+}
+
+.codex-account {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+    font-size: 12px;
+    color: #555;
+}
+
+.codex-account-status {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-wrap: anywhere;
+}
+
+.codex-account-heading {
+    color: #8e8e8e;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.codex-account-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.codex-account button {
+    border: 1px solid #d6d6d6;
+    border-radius: 6px;
+    background: white;
+    padding: 3px 8px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.codex-account button:hover:not(:disabled) {
+    border-color: #aaa;
+}
+
+.codex-account button:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.codex-account-login {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 8px;
+    border: 1px solid #d6d6d6;
+    border-radius: 8px;
+}
+
+.codex-account-login a {
+    overflow-wrap: anywhere;
+}
+
+.codex-account-code {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    user-select: all;
+}
+
+.codex-account-error {
+    color: #c0392b;
+    overflow-wrap: anywhere;
+}
+
+:root[data-theme="dark"] .codex-account {
+    color: #c4c4c9;
+}
+
+:root[data-theme="dark"] .codex-account button {
+    border-color: #3a3a3f;
+    background: #1c1c20;
+    color: #f1f1f3;
+}
+
+:root[data-theme="dark"] .codex-account-login {
+    border-color: #3a3a3f;
+}
+
+:root[data-theme="dark"] .codex-account-error {
+    color: #ff7b72;
+}
+
+.kiro-identity-center-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
+.kiro-identity-center {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.kiro-identity-center input {
+    border: 1px solid #d6d6d6;
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 12px;
+    background: white;
+    color: inherit;
+}
+
+:root[data-theme="dark"] .kiro-identity-center input {
+    border-color: #3a3a3f;
+    background: #1c1c20;
+    color: #f1f1f3;
+}

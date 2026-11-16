@@ -919,6 +919,125 @@ Prerequisites
     }
 
     /*
+     * Harnesses
+     */
+    console.log(
+        '\nHarnesses\n',
+    );
+
+    const codexAdapter =
+        path.join(
+            packageRoot,
+            'node_modules',
+            '@agentclientprotocol',
+            'codex-acp',
+            'dist',
+            'index.js',
+        );
+
+    const codexAdapterFound =
+        Boolean(
+            process.env
+                .AGENT_KITTY_CODEX_ACP,
+        ) ||
+        existsSync(
+            codexAdapter,
+        );
+
+    printCheck(
+        codexAdapterFound,
+        'Codex ACP adapter',
+        codexAdapterFound
+            ? ''
+            : 'Run "npm install" in the agent-kitty package',
+    );
+
+    /*
+     * Agent Kitty keeps its own Codex login,
+     * separate from ~/.codex.
+     */
+    const codexHome =
+        process.env
+            .AGENT_KITTY_CODEX_HOME ??
+        path.join(
+            workspaceRoot,
+            '.agent-kitty',
+            'codex',
+        );
+
+    const codexSignedIn =
+        Boolean(
+            process.env.CODEX_API_KEY ||
+                process.env
+                    .OPENAI_API_KEY,
+        ) ||
+        existsSync(
+            path.join(
+                codexHome,
+                'auth.json',
+            ),
+        );
+
+    printCheck(
+        codexSignedIn,
+        'Codex authentication',
+        codexSignedIn
+            ? codexHome
+            : `Use "Sign in" under the harness picker (credentials in ${codexHome})`,
+    );
+
+    const kiroCli =
+        process.env
+            .AGENT_KITTY_KIRO_CLI ??
+        'kiro-cli';
+
+    const kiro =
+        commandExists(
+            kiroCli,
+        );
+
+    printCheck(
+        kiro.available,
+        'Kiro CLI',
+        kiro.available
+            ? kiro.output
+            : 'Install Kiro CLI (https://kiro.dev/docs/cli/) for the Kiro harness',
+    );
+
+    if (kiro.available) {
+        const whoami =
+            spawnSync(
+                kiroCli,
+                [
+                    'whoami',
+                ],
+                {
+                    encoding:
+                        'utf8',
+
+                    stdio: [
+                        'ignore',
+                        'pipe',
+                        'pipe',
+                    ],
+                },
+            );
+
+        const kiroSignedIn =
+            whoami.status === 0;
+
+        printCheck(
+            kiroSignedIn,
+            'Kiro authentication',
+            kiroSignedIn
+                ? (whoami.stdout ?? '')
+                      .trim()
+                      .split('\n')[0] ?? ''
+                : 'Use "Sign in" under the harness picker, or run "kiro-cli login"',
+        );
+    }
+
+    /*
      * Agent Kitty root
      */
     console.log(

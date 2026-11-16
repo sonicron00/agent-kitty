@@ -4,13 +4,53 @@ import {
     type ChildProcessWithoutNullStreams,
 } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+
+import type { HarnessDefinition } from './harness.js';
+
+export type TokenUsage = {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    thoughtTokens?: number;
+    cachedReadTokens?: number;
+    cachedWriteTokens?: number;
+};
+
+export type ContextUsage = {
+    used: number;
+    size: number;
+    cost?: {
+        amount: number;
+        currency: string;
+    };
+};
+
+/*
+ * Harnesses that report usage outside the ACP spec
+ * (Kiro's "_kiro.dev/metadata") give a context
+ * percentage and metered credits instead of tokens.
+ */
+export type MeteredUsage = {
+    contextPercent?: number;
+    metering?: {
+        value: number;
+        unit: string;
+    }[];
+};
+
+export type PromptUsage = {
+    durationMs: number;
+    tokens?: TokenUsage;
+    context?: ContextUsage;
+    metered?: MeteredUsage;
+};
 
 export type PromptResult = {
     response: string;
     stopReason: string;
     sessionId: string;
+    usage: PromptUsage;
 };
 
 export type PermissionOption = {
@@ -43,6 +83,11 @@ export type ModelOption = {
 
 export type ModelState = {
     currentModelId: string | null;
+    /*
+     * The model the harness chose for this session,
+     * when it offers a "Default" choice.
+     */
+    defaultModelId: string | null;
     options: ModelOption[];
 };
 
@@ -63,6 +108,8 @@ export class WorkspaceAgent {
     private sessionId: string | null = null;
 
     private currentResponse = '';
+    private latestContextUsage: ContextUsage | null = null;
+    private latestMeteredUsage: MeteredUsage | null = null;
     private onChunk: ((text: string) => void) | null = null;
 
     private onPermission:
@@ -74,8 +121,15 @@ export class WorkspaceAgent {
     >();
 
     private modelConfigId: string | null = null;
+    /*
+     * "config" uses session/set_config_option. "legacy"
+     * is the older session "models" state with
+     * session/set_model (Kiro CLI v2 engine).
+     */
+    private modelApi: 'config' | 'legacy' | null = null;
     private currentModelId: string | null = null;
     private modelOptions: ModelOption[] = [];
+    private defaultModelId: string | null = null;
 
     private reasoningConfigId: string | null = null;
     private currentReasoningEffort: string | null = null;
@@ -85,10 +139,73 @@ export class WorkspaceAgent {
 
     private busy = false;
 
+    private stopped = false;
+
     constructor(
         private readonly workspacePath: string,
         private readonly workspaceName: string,
+        private readonly harness: HarnessDefinition,
+        private readonly loadMcpServers: () => Promise<any[]>,
     ) {}
+
+    get harnessId(): string {
+        return this.harness.id;
+    }
+
+    get harnessLabel(): string {
+        return this.harness.label;
+    }
+
+    get supportsMcpListCommand(): boolean {
+        return this.harness.supportsMcpListCommand;
+    }
+
+    isBusy(): boolean {
+        return this.busy;
+    }
+
+    stop(): void {
+        this.stopped = true;
+
+        for (const resolver of this.pendingPermissions.values()) {
+            resolver({ outcome: { outcome: 'cancelled' } });
+        }
+
+        this.pendingPermissions.clear();
+
+        const child = this.process;
+
+        this.process = null;
+        this.connection = null;
+        this.sessionId = null;
+
+        if (child && child.exitCode === null) {
+            child.kill('SIGTERM');
+
+            setTimeout(() => {
+                if (child.exitCode === null) {
+                    child.kill('SIGKILL');
+                }
+            }, 3000).unref();
+        }
+    }
+
+    private async sessionMcpServers(): Promise<any[]> {
+        if (!this.harness.mcpViaAcp) {
+            return [];
+        }
+
+        try {
+            return await this.loadMcpServers();
+        } catch (error) {
+            console.error(
+                `[${this.workspaceName}] Unable to load MCP servers`,
+                error,
+            );
+
+            return [];
+        }
+    }
 
     private updateReasoningState(
     configOptions: any[] | undefined,
@@ -100,7 +217,9 @@ export class WorkspaceAgent {
     const reasoningConfig = configOptions.find(
         (option) =>
             option.id === 'reasoning_effort' ||
+            option.id === 'effortLevel' ||
             option.category === 'reasoning_effort' ||
+            option.category === 'thought_level' ||
             option.name?.toLowerCase().includes('reasoning'),
     );
 
@@ -183,6 +302,7 @@ private reasoningState(): ReasoningState {
         }
 
         this.modelConfigId = modelConfig.id;
+        this.modelApi = 'config';
 
         if (
             typeof modelConfig.currentValue ===
@@ -233,10 +353,103 @@ private reasoningState(): ReasoningState {
         );
     }
 
+    /*
+     * Older ACP agents (Kiro CLI v2) return
+     * { availableModels, currentModelId } in "models"
+     * instead of a model config option.
+     */
+    private updateLegacyModelState(
+        models: any,
+    ): void {
+        if (
+            this.modelApi === 'config' ||
+            !models ||
+            !Array.isArray(models.availableModels)
+        ) {
+            return;
+        }
+
+        this.modelApi = 'legacy';
+        this.modelConfigId = null;
+
+        this.modelOptions = models.availableModels
+            .filter(
+                (model: any) =>
+                    typeof model?.modelId === 'string',
+            )
+            .map((model: any) => ({
+                value: model.modelId,
+                name: model.name ?? model.modelId,
+                ...(model.description
+                    ? { description: model.description }
+                    : {}),
+            }));
+
+        if (typeof models.currentModelId === 'string') {
+            this.currentModelId = models.currentModelId;
+        }
+    }
+
+    private applySessionState(session: any): void {
+        this.modelApi = null;
+        this.modelConfigId = null;
+
+        const configOptions = session?.configOptions;
+
+        this.updateModelState(configOptions);
+        this.updateReasoningState(configOptions);
+        this.updateLegacyModelState(session?.models);
+
+        this.defaultModelId = this.currentModelId;
+    }
+
+    private async applyModel(
+        modelId: string,
+    ): Promise<void> {
+        if (!this.connection || !this.sessionId) {
+            throw new Error(
+                'ACP session is not available',
+            );
+        }
+
+        if (this.modelApi === 'legacy') {
+            await this.connection.extMethod(
+                'session/set_model',
+                {
+                    sessionId: this.sessionId,
+                    modelId,
+                },
+            );
+        } else if (this.modelConfigId) {
+            const result =
+                await this.connection.setSessionConfigOption({
+                    sessionId: this.sessionId,
+                    configId: this.modelConfigId,
+                    value: modelId,
+                });
+
+            const configOptions =
+                (result as any).configOptions;
+
+            this.updateModelState(configOptions);
+            this.updateReasoningState(configOptions);
+        } else {
+            throw new Error(
+                `${this.harness.label} did not advertise a model selector`,
+            );
+        }
+
+        this.currentModelId = modelId;
+    }
+
     private modelState(): ModelState {
         return {
             currentModelId:
                 this.currentModelId,
+            defaultModelId:
+                this.harness.offersDefaultModel
+                    ? this.defaultModelId
+                    : null,
             options: this.modelOptions,
         };
     }
@@ -269,13 +482,13 @@ async setReasoning(
 
     if (!this.reasoningConfigId) {
         throw new Error(
-            'This Copilot session does not expose configurable reasoning',
+            `This ${this.harness.label} session does not expose configurable reasoning`,
         );
     }
 
     if (this.busy) {
         throw new Error(
-            'Cannot change reasoning while Copilot is working',
+            `Cannot change reasoning while ${this.harness.label} is working`,
         );
     }
 
@@ -325,15 +538,15 @@ async setModel(
         );
     }
 
-    if (!this.modelConfigId) {
+    if (!this.modelApi) {
         throw new Error(
-            'Copilot did not advertise a model selector',
+            `${this.harness.label} did not advertise a model selector`,
         );
     }
 
     if (this.busy) {
         throw new Error(
-            'Cannot change model while Copilot is working',
+            `Cannot change model while ${this.harness.label} is working`,
         );
     }
 
@@ -349,20 +562,9 @@ async setModel(
         );
     }
 
-    const result =
-        await this.connection.setSessionConfigOption({
-            sessionId: this.sessionId,
-            configId:
-                this.modelConfigId,
-            value: modelId,
-        });
-        this.updateModelState(
-            (result as any).configOptions,
-        );
+    await this.applyModel(modelId);
 
-        this.currentModelId = modelId;
-
-        return this.modelState();
+    return this.modelState();
 }
 
     private onToolActivity:
@@ -396,27 +598,68 @@ private async startInternal(): Promise<void> {
             return;
         }
 
-        const startScript = path.join(
+        if (this.stopped) {
+            throw new Error(
+                `${this.workspaceName} agent was stopped`,
+            );
+        }
+
+        const launch = this.harness.launch(
             this.workspacePath,
-            'start',
         );
 
         const copilotProcess = spawn(
-            startScript,
-            ['--acp', '--stdio'],
+            launch.command,
+            launch.args,
             {
                 cwd: this.workspacePath,
-                env: process.env,
+                env: {
+                    ...process.env,
+                    ...launch.env,
+                },
                 stdio: ['pipe', 'pipe', 'pipe'],
             },
         );
 
         this.process = copilotProcess;
 
+        const spawnFailed = new Promise<never>(
+            (_resolve, reject) => {
+                copilotProcess.once('error', (error) => {
+                    console.error(
+                        `[${this.workspaceName}] Unable to start ${this.harness.label}`,
+                        error,
+                    );
+
+                    reject(
+                        new Error(
+                            `Unable to start ${this.harness.label}: ${error.message}`,
+                        ),
+                    );
+                });
+
+                copilotProcess.once('exit', (code, signal) => {
+                    reject(
+                        new Error(
+                            `${this.harness.label} exited during startup (code ${code}, signal ${signal})`,
+                        ),
+                    );
+                });
+            },
+        );
+
+        spawnFailed.catch(() => undefined);
+
+        let startupStderr = '';
+
         copilotProcess.stderr.on('data', (data) => {
             const text = data.toString().trim();
 
             if (text) {
+                if (!this.sessionId) {
+                    startupStderr = `${startupStderr}\n${text}`.slice(-2000);
+                }
+
                 console.error(
                     `[${this.workspaceName}] ${text}`,
                 );
@@ -425,9 +668,13 @@ private async startInternal(): Promise<void> {
 
         copilotProcess.on('exit', (code, signal) => {
             console.log(
-                `[${this.workspaceName}] Copilot exited`,
+                `[${this.workspaceName}] ${this.harness.label} exited`,
                 { code, signal },
             );
+
+            if (this.process !== copilotProcess) {
+                return;
+            }
 
             this.process = null;
             this.connection = null;
@@ -532,6 +779,36 @@ private async startInternal(): Promise<void> {
 
             if (
                 update.sessionUpdate ===
+                'usage_update'
+            ) {
+                const usage = update as any;
+
+                if (
+                    typeof usage.used === 'number' &&
+                    typeof usage.size === 'number'
+                ) {
+                    this.latestContextUsage = {
+                        used: usage.used,
+                        size: usage.size,
+                        ...(usage.cost &&
+                        typeof usage.cost.amount === 'number'
+                            ? {
+                                  cost: {
+                                      amount: usage.cost.amount,
+                                      currency: String(
+                                          usage.cost.currency ?? 'USD',
+                                      ),
+                                  },
+                              }
+                            : {}),
+                    };
+                }
+
+                return;
+            }
+
+            if (
+                update.sessionUpdate ===
                     'agent_message_chunk' &&
                 update.content.type === 'text'
             ) {
@@ -591,6 +868,32 @@ private async startInternal(): Promise<void> {
                     return;
             }
         },
+
+        /*
+         * Harness-specific notifications (for example
+         * Kiro's "_kiro.dev/*") are optional extras.
+         * Only Kiro's per-turn metadata is used, as
+         * it is Kiro's only source of usage figures.
+         */
+        extNotification: async (method, params) => {
+            if (
+                method.replace(/^_/, '') !==
+                    'kiro.dev/metadata' ||
+                !this.busy ||
+                (params as any)?.sessionId !== this.sessionId
+            ) {
+                return;
+            }
+
+            const metered = toMeteredUsage(params);
+
+            if (metered) {
+                this.latestMeteredUsage = {
+                    ...this.latestMeteredUsage,
+                    ...metered,
+                };
+            }
+        },
             
         };
         
@@ -603,24 +906,88 @@ private async startInternal(): Promise<void> {
 
         this.connection = connection;
 
-        await connection.initialize({
-            protocolVersion: acp.PROTOCOL_VERSION,
-            clientCapabilities: {},
-        });
+        let session: acp.NewSessionResponse;
 
-        const session =
-            await connection.newSession({
-                cwd: this.workspacePath,
-                mcpServers: [],
+        try {
+            session = await Promise.race([
+                spawnFailed,
+                (async () => {
+                    await connection.initialize({
+                        protocolVersion: acp.PROTOCOL_VERSION,
+                        clientCapabilities: {},
+                    });
+
+                    return await connection.newSession({
+                        cwd: this.workspacePath,
+                        mcpServers:
+                            await this.sessionMcpServers(),
+                    });
+                })(),
+            ]);
+        } catch (error) {
+            if (this.process === copilotProcess) {
+                this.process = null;
+                this.connection = null;
+                this.sessionId = null;
+            }
+
+            if (copilotProcess.exitCode === null) {
+                copilotProcess.kill('SIGTERM');
+            }
+
+            if ((error as { code?: unknown })?.code === -32000) {
+                throw new Error(
+                    `${this.harness.label} is not signed in. ${this.harness.signInHint}`,
+                );
+            }
+
+            /*
+             * Let the remaining stderr arrive so the
+             * harness's own reason can be reported.
+             */
+            await new Promise<void>((resolve) => {
+                if (copilotProcess.stderr.readableEnded) {
+                    resolve();
+                    return;
+                }
+
+                copilotProcess.stderr.once('end', resolve);
+                setTimeout(resolve, 1000).unref();
             });
+
+            const reason = startupStderr.trim();
+
+            if (/not (logged|signed) in/i.test(reason)) {
+                throw new Error(
+                    `${this.harness.label} is not signed in. ${this.harness.signInHint}`,
+                );
+            }
+
+            if (reason && error instanceof Error) {
+                const lastLines = reason
+                    .split('\n')
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .slice(-3)
+                    .join(' ');
+
+                throw new Error(
+                    `${error.message}: ${lastLines}`,
+                );
+            }
+
+            throw error;
+        }
+
+        if (this.process !== copilotProcess) {
+            throw new Error(
+                `${this.workspaceName} agent was stopped during startup`,
+            );
+        }
 
         this.sessionId = session.sessionId;
 
-        const configOptions =
-            (session as any).configOptions;
-
-        this.updateModelState(configOptions);
-        this.updateReasoningState(configOptions);
+        this.applySessionState(session);
 
     };
 
@@ -710,6 +1077,11 @@ async resetSession(): Promise<void> {
     const previousModelId =
         this.currentModelId;
 
+    const followedDefault =
+        this.harness.offersDefaultModel &&
+        previousModelId ===
+            this.defaultModelId;
+
     this.currentResponse = '';
     this.onChunk = null;
     this.onPermission = null;
@@ -718,53 +1090,35 @@ async resetSession(): Promise<void> {
     const session =
         await this.connection.newSession({
             cwd: this.workspacePath,
-            mcpServers: [],
+            mcpServers:
+                await this.sessionMcpServers(),
         });
 
     this.sessionId =
         session.sessionId;
 
-    const configOptions =
-        (session as any).configOptions;
-
-    this.updateModelState(
-        configOptions,
-    );
-
-    this.updateReasoningState(
-        configOptions,
-    );
+    this.applySessionState(session);
 
     /*
      * Keep the currently selected model
-     * after starting the new chat.
+     * after starting the new chat, unless it
+     * was the harness default.
      */
     if (
+        !followedDefault &&
         previousModelId &&
-        this.modelConfigId &&
+        previousModelId !==
+            this.currentModelId &&
+        this.modelApi &&
         this.modelOptions.some(
             (model) =>
                 model.value ===
                 previousModelId,
         )
     ) {
-        const result =
-            await this.connection.setSessionConfigOption({
-                sessionId:
-                    this.sessionId,
-                configId:
-                    this.modelConfigId,
-                value:
-                    previousModelId,
-            });
-
-        this.updateModelState(
-            (result as any)
-                .configOptions,
+        await this.applyModel(
+            previousModelId,
         );
-
-        this.currentModelId =
-            previousModelId;
     }
 }
 
@@ -846,7 +1200,11 @@ async getMcpServerStatusText(
 
         this.busy = true;
         this.currentResponse = '';
-        
+        this.latestContextUsage = null;
+        this.latestMeteredUsage = null;
+
+        const startedAt = Date.now();
+
         this.onChunk =
             callbacks?.onChunk ?? null;
 
@@ -868,10 +1226,22 @@ async getMcpServerStatusText(
                     ],
                 });
 
+            const tokens = toTokenUsage(result.usage);
+
             return {
                 response: this.currentResponse,
                 stopReason: result.stopReason,
                 sessionId: this.sessionId,
+                usage: {
+                    durationMs: Date.now() - startedAt,
+                    ...(tokens ? { tokens } : {}),
+                    ...(this.latestContextUsage
+                        ? { context: this.latestContextUsage }
+                        : {}),
+                    ...(this.latestMeteredUsage
+                        ? { metered: this.latestMeteredUsage }
+                        : {}),
+                },
             };
         } finally {
             this.onChunk = null;
@@ -880,4 +1250,76 @@ async getMcpServerStatusText(
             this.busy = false;
         }
     }
+}
+
+function toMeteredUsage(
+    params: unknown,
+): MeteredUsage | undefined {
+    const raw = params as any;
+    const result: MeteredUsage = {};
+
+    if (typeof raw?.contextUsagePercentage === 'number') {
+        result.contextPercent = raw.contextUsagePercentage;
+    }
+
+    if (Array.isArray(raw?.meteringUsage)) {
+        const metering = raw.meteringUsage
+            .filter(
+                (entry: any) =>
+                    typeof entry?.value === 'number',
+            )
+            .map((entry: any) => ({
+                value: entry.value,
+                unit: String(
+                    entry.value === 1
+                        ? entry.unit ?? ''
+                        : entry.unitPlural ?? entry.unit ?? '',
+                ),
+            }));
+
+        if (metering.length > 0) {
+            result.metering = metering;
+        }
+    }
+
+    return Object.keys(result).length > 0
+        ? result
+        : undefined;
+}
+
+/*
+ * ACP reports per-turn token usage on the prompt
+ * response (unstable in the spec, but both Copilot
+ * and codex-acp send it). Optional counts are dropped
+ * when the harness omits them.
+ */
+function toTokenUsage(
+    usage: acp.Usage | null | undefined,
+): TokenUsage | undefined {
+    if (
+        !usage ||
+        typeof usage.totalTokens !== 'number'
+    ) {
+        return undefined;
+    }
+
+    const result: TokenUsage = {
+        inputTokens: usage.inputTokens ?? 0,
+        outputTokens: usage.outputTokens ?? 0,
+        totalTokens: usage.totalTokens,
+    };
+
+    for (const key of [
+        'thoughtTokens',
+        'cachedReadTokens',
+        'cachedWriteTokens',
+    ] as const) {
+        const value = usage[key];
+
+        if (typeof value === 'number') {
+            result[key] = value;
+        }
+    }
+
+    return result;
 }
