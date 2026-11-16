@@ -1,9 +1,11 @@
 import {
+    useCallback,
     useEffect,
     useMemo,
     useRef,
     useState,
     type FormEvent,
+    type PointerEvent as ReactPointerEvent,
 } from 'react';
 
 import ReactMarkdown from 'react-markdown';
@@ -12,6 +14,8 @@ import rehypeHighlight from 'rehype-highlight';
 
 import 'highlight.js/styles/github.css';
 import './App.css';
+import { CodexAccountPanel } from './CodexAccount';
+import { KiroAccountPanel } from './KiroAccount';
 
 
 /*
@@ -35,10 +39,49 @@ type WorkspaceView =
     | 'code'
     | 'mcps';
 
+type MessageUsage = {
+    durationMs?: number;
+    tokens?: {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        thoughtTokens?: number;
+        cachedReadTokens?: number;
+        cachedWriteTokens?: number;
+    };
+    context?: {
+        used: number;
+        size: number;
+        cost?: {
+            amount: number;
+            currency: string;
+        };
+    };
+    metered?: {
+        contextPercent?: number;
+        metering?: {
+            value: number;
+            unit: string;
+        }[];
+    };
+};
+
 type Message = {
     id: string;
     role: 'user' | 'assistant';
     content: string;
+    usage?: MessageUsage;
+
+    /*
+     * Set when the server carried context over
+     * from another harness, or from before a
+     * restart, for this response.
+     */
+    handoff?: {
+        from: string[];
+        mode: 'summary' | 'transcript';
+        reason?: 'switch' | 'restart';
+    };
 };
 
 type Repository = {
@@ -88,8 +131,15 @@ type ModelOption = {
 
 type ModelState = {
     currentModelId: string | null;
+    defaultModelId?: string | null;
     options: ModelOption[];
 };
+
+/*
+ * Picker value for "follow the harness's recommended
+ * model" (Codex). Never sent to the server.
+ */
+const DEFAULT_MODEL_VALUE = '__default__';
 
 type ReasoningOption = {
     value: string;
@@ -133,6 +183,188 @@ const CONVERSATIONS_STORAGE_KEY =
 
 const MODELS_STORAGE_KEY =
     'agent-kitty-models';
+
+const COMPOSER_HEIGHT_STORAGE_KEY =
+    'agent-kitty-composer-height';
+
+const ACCOUNTS_OPEN_STORAGE_KEY =
+    'agent-kitty-accounts-open';
+
+const COMPOSER_MIN_HEIGHT = 50;
+
+function composerMaxHeight(): number {
+    return Math.max(
+        COMPOSER_MIN_HEIGHT,
+        Math.round(window.innerHeight * 0.7),
+    );
+}
+
+function clampComposerHeight(
+    height: number,
+): number {
+    return Math.min(
+        composerMaxHeight(),
+        Math.max(COMPOSER_MIN_HEIGHT, height),
+    );
+}
+
+function loadComposerHeight(): number | null {
+    const stored = Number(
+        localStorage.getItem(
+            COMPOSER_HEIGHT_STORAGE_KEY,
+        ),
+    );
+
+    return Number.isFinite(stored) && stored > 0
+        ? clampComposerHeight(stored)
+        : null;
+}
+
+function formatTokens(count: number): string {
+    if (count >= 1_000_000) {
+        return `${(count / 1_000_000).toFixed(1)}M`;
+    }
+
+    if (count >= 1_000) {
+        return `${(count / 1_000).toFixed(1)}k`;
+    }
+
+    return String(count);
+}
+
+function formatDuration(ms: number): string {
+    const seconds = ms / 1000;
+
+    if (seconds < 60) {
+        return `${seconds.toFixed(1)}s`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+
+    return `${minutes}m ${Math.round(seconds % 60)}s`;
+}
+
+function usageParts(
+    usage: MessageUsage,
+): string[] {
+    const parts: string[] = [];
+    const { tokens, context } = usage;
+
+    if (tokens) {
+        parts.push(
+            `${formatTokens(tokens.inputTokens)} in`,
+            `${formatTokens(tokens.outputTokens)} out`,
+        );
+
+        if (tokens.thoughtTokens) {
+            parts.push(
+                `${formatTokens(tokens.thoughtTokens)} reasoning`,
+            );
+        }
+
+        if (tokens.cachedReadTokens) {
+            parts.push(
+                `${formatTokens(tokens.cachedReadTokens)} cache read`,
+            );
+        }
+
+        if (tokens.cachedWriteTokens) {
+            parts.push(
+                `${formatTokens(tokens.cachedWriteTokens)} cache write`,
+            );
+        }
+
+        parts.push(
+            `${formatTokens(tokens.totalTokens)} total`,
+        );
+    }
+
+    if (context && context.size > 0) {
+        const percent = Math.round(
+            (context.used / context.size) * 100,
+        );
+
+        parts.push(
+            `context ${percent}% (${formatTokens(context.used)}/${formatTokens(context.size)})`,
+        );
+    }
+
+    if (context?.cost) {
+        parts.push(
+            `${context.cost.amount.toFixed(4)} ${context.cost.currency}`,
+        );
+    }
+
+    const metered = usage.metered;
+
+    if (
+        !(context && context.size > 0) &&
+        typeof metered?.contextPercent === 'number'
+    ) {
+        parts.push(
+            `context ${Math.round(metered.contextPercent)}%`,
+        );
+    }
+
+    for (const entry of metered?.metering ?? []) {
+        parts.push(
+            `${entry.value.toFixed(entry.value < 1 ? 4 : 2)} ${entry.unit}`.trim(),
+        );
+    }
+
+    if (typeof usage.durationMs === 'number') {
+        parts.push(formatDuration(usage.durationMs));
+    }
+
+    return parts;
+}
+
+const HISTORY_TURN_LIMIT = 12;
+const HISTORY_TEXT_LIMIT = 4_000;
+
+/*
+ * Pair up the visible chat so the server can replay it
+ * to a new agent session if it has no saved transcript
+ * of its own (for example a chat from an older build).
+ */
+function historyForServer(
+    messages: Message[],
+): { user: string; assistant: string }[] {
+    const turns: {
+        user: string;
+        assistant: string;
+    }[] = [];
+
+    for (
+        let index = 0;
+        index < messages.length;
+        index += 1
+    ) {
+        const message = messages[index];
+
+        if (message.role !== 'user') {
+            continue;
+        }
+
+        const next = messages[index + 1];
+
+        turns.push({
+            user: message.content.slice(
+                0,
+                HISTORY_TEXT_LIMIT,
+            ),
+            assistant:
+                next?.role === 'assistant'
+                    ? next.content.slice(
+                          0,
+                          HISTORY_TEXT_LIMIT,
+                      )
+                    : '',
+        });
+    }
+
+    return turns.slice(-HISTORY_TURN_LIMIT);
+}
 
 function loadStoredConversations():
     Conversations {
@@ -183,6 +415,32 @@ function getStoredModels(
             : {};
     } catch {
         return {};
+    }
+}
+
+function clearStoredModel(
+    harnessId: string,
+    workspaceId: string,
+): void {
+    try {
+        const stored =
+            getStoredModels(
+                harnessId,
+            );
+
+        delete stored[workspaceId];
+
+        localStorage.setItem(
+            modelsStorageKey(
+                harnessId,
+            ),
+            JSON.stringify(stored),
+        );
+    } catch (error) {
+        console.error(
+            'Unable to clear persisted model',
+            error,
+        );
     }
 }
 
@@ -547,6 +805,14 @@ function App() {
 
     const [theme, setTheme] = useState<Theme>(getInitialTheme);
 
+    const [accountsOpen, setAccountsOpen] =
+        useState<boolean>(
+            () =>
+                localStorage.getItem(
+                    ACCOUNTS_OPEN_STORAGE_KEY,
+                ) === 'true',
+        );
+
     const [
         harnessState,
         setHarnessState,
@@ -563,6 +829,103 @@ function App() {
         harnessState?.current ??
         null;
 
+    const [composerHeight, setComposerHeight] =
+        useState<number | null>(
+            loadComposerHeight,
+        );
+
+    const composerTextareaRef =
+        useRef<HTMLTextAreaElement | null>(
+            null,
+        );
+
+    /*
+     * The handle sits on the top edge of the composer,
+     * so dragging up grows the textarea.
+     */
+    function startComposerResize(
+        event: ReactPointerEvent<HTMLDivElement>,
+    ) {
+        const textarea =
+            composerTextareaRef.current;
+
+        if (!textarea) {
+            return;
+        }
+
+        event.preventDefault();
+
+        const handle = event.currentTarget;
+        const pointerId = event.pointerId;
+        const startY = event.clientY;
+        const startHeight =
+            textarea.getBoundingClientRect().height;
+
+        handle.setPointerCapture(pointerId);
+        document.body.classList.add(
+            'resizing-composer',
+        );
+
+        let latest = startHeight;
+
+        const onMove = (move: PointerEvent) => {
+            latest = clampComposerHeight(
+                startHeight + (startY - move.clientY),
+            );
+
+            setComposerHeight(latest);
+        };
+
+        const onEnd = () => {
+            handle.removeEventListener(
+                'pointermove',
+                onMove,
+            );
+            handle.removeEventListener(
+                'pointerup',
+                onEnd,
+            );
+            handle.removeEventListener(
+                'pointercancel',
+                onEnd,
+            );
+
+            if (handle.hasPointerCapture(pointerId)) {
+                handle.releasePointerCapture(pointerId);
+            }
+
+            document.body.classList.remove(
+                'resizing-composer',
+            );
+
+            localStorage.setItem(
+                COMPOSER_HEIGHT_STORAGE_KEY,
+                String(Math.round(latest)),
+            );
+        };
+
+        handle.addEventListener(
+            'pointermove',
+            onMove,
+        );
+        handle.addEventListener(
+            'pointerup',
+            onEnd,
+        );
+        handle.addEventListener(
+            'pointercancel',
+            onEnd,
+        );
+    }
+
+    function resetComposerHeight() {
+        setComposerHeight(null);
+
+        localStorage.removeItem(
+            COMPOSER_HEIGHT_STORAGE_KEY,
+        );
+    }
+
     const harnessLabel =
         harnessState?.harnesses.find(
             (harness) =>
@@ -574,6 +937,22 @@ function App() {
         Object.values(
             sendingByWorkspace,
         ).some(Boolean);
+
+    const showCodexAccount =
+        harnessState?.harnesses.some(
+            (harness) =>
+                harness.id === 'codex',
+        ) ?? false;
+
+    const showKiroAccount =
+        harnessState?.harnesses.some(
+            (harness) =>
+                harness.id === 'kiro' &&
+                (harness.available ||
+                    harness.detail?.startsWith(
+                        'Not signed in',
+                    )),
+        ) ?? false;
 
     /*
      * ----------------------------------------------------------------------
@@ -622,6 +1001,27 @@ function App() {
                   selectedId
               ]
             : undefined;
+
+    /*
+     * Without a saved model the session runs on the
+     * harness's recommended model.
+     */
+    const storedModelOverride =
+        selectedId && harnessId
+            ? getStoredModels(
+                  harnessId,
+              )[selectedId]
+            : undefined;
+
+    const followsDefaultModel =
+        Boolean(
+            modelState?.defaultModelId,
+        ) &&
+        !modelState?.options.some(
+            (model) =>
+                model.value ===
+                storedModelOverride,
+        );
 
     const reasoningState =
         selectedId
@@ -718,8 +1118,8 @@ function App() {
      * ----------------------------------------------------------------------
      */
 
-    useEffect(() => {
-        async function loadHarness() {
+    const loadHarness = useCallback(
+        async () => {
             try {
                 const response =
                     await fetch(
@@ -746,10 +1146,13 @@ function App() {
                         : 'Unable to load harness',
                 );
             }
-        }
+        },
+        [],
+    );
 
+    useEffect(() => {
         loadHarness();
-    }, []);
+    }, [loadHarness]);
 
     async function changeHarness(
         nextHarnessId: string,
@@ -797,8 +1200,10 @@ function App() {
             }
 
             /*
-             * Every agent restarts on the new
-             * harness, so drop per-session state.
+             * The server parks the old agents and
+             * resumes any on the new harness, so
+             * refetch per-session state. The chat
+             * itself is kept and handed over.
              */
             setModelsByWorkspace({});
             setReasoningByWorkspace({});
@@ -1226,6 +1631,43 @@ function App() {
         pendingPermission,
     ]);
 
+    /*
+     * Opening an agent (or returning to its chat)
+     * jumps straight to the latest message. This runs
+     * after the smooth scroll above so it wins, and
+     * again on the next frame once layout settles.
+     */
+    useEffect(() => {
+        if (workspaceView !== 'chat') {
+            return;
+        }
+
+        const jumpToBottom = () => {
+            conversationEndRef.current
+                ?.scrollIntoView({
+                    behavior:
+                        'auto',
+                    block:
+                        'end',
+                });
+        };
+
+        jumpToBottom();
+
+        const frame =
+            requestAnimationFrame(
+                jumpToBottom,
+            );
+
+        return () =>
+            cancelAnimationFrame(
+                frame,
+            );
+    }, [
+        selectedId,
+        workspaceView,
+    ]);
+
 
     /*
      * ----------------------------------------------------------------------
@@ -1434,6 +1876,21 @@ function App() {
         const workspaceId =
             selectedId;
 
+        const useDefault =
+            modelId ===
+            DEFAULT_MODEL_VALUE;
+
+        const targetModelId =
+            useDefault
+                ? modelsByWorkspace[
+                      workspaceId
+                  ]?.defaultModelId
+                : modelId;
+
+        if (!targetModelId) {
+            return;
+        }
+
         setChangingModel(true);
         setError(null);
 
@@ -1453,7 +1910,8 @@ function App() {
                         body:
                             JSON.stringify(
                                 {
-                                    modelId,
+                                    modelId:
+                                        targetModelId,
                                 },
                             ),
                     },
@@ -1479,11 +1937,18 @@ function App() {
             );
 
             if (harnessId) {
-                storeModel(
-                    harnessId,
-                    workspaceId,
-                    modelId,
-                );
+                if (useDefault) {
+                    clearStoredModel(
+                        harnessId,
+                        workspaceId,
+                    );
+                } else {
+                    storeModel(
+                        harnessId,
+                        workspaceId,
+                        modelId,
+                    );
+                }
             }
         } catch (error) {
             setError(
@@ -1826,6 +2291,78 @@ function App() {
 
         if (
             event.type ===
+                'handoff' &&
+            Array.isArray(event.from)
+        ) {
+            setConversations(
+                (current) => ({
+                    ...current,
+
+                    [workspaceId]:
+                        (
+                            current[
+                                workspaceId
+                            ] ?? []
+                        ).map(
+                            (message) =>
+                                message.id ===
+                                assistantMessageId
+                                    ? {
+                                          ...message,
+                                          handoff: {
+                                              from:
+                                                  event.from as string[],
+                                              mode:
+                                                  event.mode === 'summary'
+                                                      ? 'summary'
+                                                      : 'transcript',
+                                              reason:
+                                                  event.reason === 'restart'
+                                                      ? 'restart'
+                                                      : 'switch',
+                                          },
+                                      }
+                                    : message,
+                        ),
+                }),
+            );
+
+            return;
+        }
+
+        if (
+            event.type ===
+                'done' &&
+            event.usage
+        ) {
+            setConversations(
+                (current) => ({
+                    ...current,
+
+                    [workspaceId]:
+                        (
+                            current[
+                                workspaceId
+                            ] ?? []
+                        ).map(
+                            (message) =>
+                                message.id ===
+                                assistantMessageId
+                                    ? {
+                                          ...message,
+                                          usage:
+                                              event.usage as MessageUsage,
+                                      }
+                                    : message,
+                        ),
+                }),
+            );
+
+            return;
+        }
+
+        if (
+            event.type ===
             'error'
         ) {
             throw new Error(
@@ -1970,6 +2507,20 @@ function App() {
                 text ||
                     'Please review the attached file(s).',
             );
+
+            const history =
+                historyForServer(
+                    conversations[
+                        workspaceId
+                    ] ?? [],
+                );
+
+            if (history.length > 0) {
+                formData.append(
+                    'history',
+                    JSON.stringify(history),
+                );
+            }
 
             for (
                 const file of
@@ -2207,6 +2758,61 @@ function App() {
                             Loading…
                         </span>
                     )}
+
+                    {showCodexAccount ||
+                    showKiroAccount ? (
+                        /*
+                         * Closed <details> keep their children
+                         * mounted, so an in-progress sign-in
+                         * survives collapsing the section.
+                         */
+                        <details
+                            className="account-group"
+                            open={accountsOpen}
+                            onToggle={(event) => {
+                                const open =
+                                    event.currentTarget
+                                        .open;
+
+                                setAccountsOpen(open);
+
+                                localStorage.setItem(
+                                    ACCOUNTS_OPEN_STORAGE_KEY,
+                                    String(open),
+                                );
+                            }}
+                        >
+                            <summary>
+                                Sign-ins
+                            </summary>
+
+                            <div className="account-group-body">
+                                {showCodexAccount ? (
+                                    <CodexAccountPanel
+                                        disabled={
+                                            anySending ||
+                                            switchingHarness
+                                        }
+                                        onChanged={
+                                            loadHarness
+                                        }
+                                    />
+                                ) : null}
+
+                                {showKiroAccount ? (
+                                    <KiroAccountPanel
+                                        disabled={
+                                            anySending ||
+                                            switchingHarness
+                                        }
+                                        onChanged={
+                                            loadHarness
+                                        }
+                                    />
+                                ) : null}
+                            </div>
+                        </details>
+                    ) : null}
                 </div>
 
                 <div className="sidebar-heading">
@@ -2334,8 +2940,10 @@ function App() {
                                         <select
                                             id="model"
                                             value={
-                                                modelState.currentModelId ??
-                                                ''
+                                                followsDefaultModel
+                                                    ? DEFAULT_MODEL_VALUE
+                                                    : modelState.currentModelId ??
+                                                      ''
                                             }
                                             disabled={
                                                 sending ||
@@ -2351,6 +2959,24 @@ function App() {
                                                 )
                                             }
                                         >
+                                            {modelState.defaultModelId ? (
+                                                <option
+                                                    value={
+                                                        DEFAULT_MODEL_VALUE
+                                                    }
+                                                >
+                                                    {`Default (${harnessLabel} recommended: ${
+                                                        modelState.options.find(
+                                                            (
+                                                                model,
+                                                            ) =>
+                                                                model.value ===
+                                                                modelState.defaultModelId,
+                                                        )?.name ??
+                                                        modelState.defaultModelId
+                                                    })`}
+                                                </option>
+                                            ) : null}
                                             {modelState.options.map(
                                                 (
                                                     model,
@@ -2592,6 +3218,25 @@ function App() {
                                                                   )}
                                                         </div>
 
+                                                        {message.handoff && (
+                                                            <div
+                                                                className="message-handoff"
+                                                                title={
+                                                                    message.handoff.mode ===
+                                                                    'summary'
+                                                                        ? 'Sent a handoff summary and recent turns to this agent'
+                                                                        : 'Sent the recent transcript to this agent'
+                                                                }
+                                                            >
+                                                                {message.handoff.reason ===
+                                                                'restart'
+                                                                    ? 'Earlier conversation restored after restart'
+                                                                    : `Context carried over from ${message.handoff.from.join(
+                                                                          ', ',
+                                                                      )}`}
+                                                            </div>
+                                                        )}
+
                                                         <div className="message-content">
                                                             {message.role ===
                                                             'assistant' ? (
@@ -2617,6 +3262,21 @@ function App() {
                                                                 message.content
                                                             )}
                                                         </div>
+
+                                                        {message.role ===
+                                                            'assistant' &&
+                                                            message.usage && (
+                                                                <div
+                                                                    className="message-usage"
+                                                                    title="Usage reported by the harness for this response"
+                                                                >
+                                                                    {usageParts(
+                                                                        message.usage,
+                                                                    ).join(
+                                                                        ' · ',
+                                                                    )}
+                                                                </div>
+                                                            )}
                                                     </div>
                                                 ),
                                             )}
@@ -2748,6 +3408,20 @@ function App() {
                                         sendPrompt
                                     }
                                 >
+                                    <div
+                                        className="composer-resize-handle"
+                                        role="separator"
+                                        aria-orientation="horizontal"
+                                        aria-label="Drag to resize the message box"
+                                        title="Drag to resize, double-click to reset"
+                                        onPointerDown={
+                                            startComposerResize
+                                        }
+                                        onDoubleClick={
+                                            resetComposerHeight
+                                        }
+                                    />
+
                                     {sending && (
                                         <div
                                             className="kitty-thinking"
@@ -2852,6 +3526,16 @@ function App() {
                                     )}
 
                                     <textarea
+                                        ref={
+                                            composerTextareaRef
+                                        }
+                                        style={
+                                            composerHeight
+                                                ? {
+                                                      height: composerHeight,
+                                                  }
+                                                : undefined
+                                        }
                                         value={
                                             prompt
                                         }

@@ -1,11 +1,10 @@
 import fs from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import os from 'node:os';
+import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 
-export type HarnessId = 'copilot' | 'codex';
+export type HarnessId = 'copilot' | 'codex' | 'kiro';
 
 export type HarnessLaunch = {
     command: string;
@@ -31,6 +30,19 @@ export type HarnessDefinition = {
      * configured server list.
      */
     supportsMcpListCommand: boolean;
+
+    /*
+     * Codex picks a recommended model for each new
+     * session. The UI offers that as a "Default" choice
+     * instead of pinning a concrete model.
+     */
+    offersDefaultModel: boolean;
+
+    /*
+     * Shown when the harness rejects a session because
+     * nobody is signed in.
+     */
+    signInHint: string;
 
     launch(workspacePath: string): HarnessLaunch;
 
@@ -82,6 +94,42 @@ function resolveCodexAcpEntry(): string | null {
     }
 }
 
+/*
+ * Agent Kitty keeps its own Codex credentials so the
+ * account it uses is independent of a personal
+ * ~/.codex login. AGENT_KITTY_CODEX_HOME overrides the
+ * location (set it to ~/.codex to share that login).
+ */
+let kittyRoot: string = process.cwd();
+
+export function configureHarnessRoot(
+    root: string,
+): void {
+    kittyRoot = root;
+}
+
+export function codexHome(): string {
+    return (
+        process.env.AGENT_KITTY_CODEX_HOME ??
+        path.join(
+            kittyRoot,
+            '.agent-kitty',
+            'codex',
+        )
+    );
+}
+
+export function ensureCodexHome(): string {
+    const home = codexHome();
+
+    mkdirSync(home, {
+        recursive: true,
+        mode: 0o700,
+    });
+
+    return home;
+}
+
 function hasCodexCredentials(): boolean {
     if (
         process.env.CODEX_API_KEY ||
@@ -90,13 +138,79 @@ function hasCodexCredentials(): boolean {
         return true;
     }
 
-    const codexHome =
-        process.env.CODEX_HOME ??
-        path.join(os.homedir(), '.codex');
-
     return existsSync(
-        path.join(codexHome, 'auth.json'),
+        path.join(codexHome(), 'auth.json'),
     );
+}
+
+/*
+ * Kiro CLI keeps its own login (kiro-cli login).
+ * AGENT_KITTY_KIRO_CLI overrides the executable.
+ */
+export function kiroCli(): string {
+    return (
+        process.env.AGENT_KITTY_KIRO_CLI ??
+        'kiro-cli'
+    );
+}
+
+const KIRO_ENGINES = ['v1', 'v2', 'v3'];
+
+/*
+ * "kiro-cli whoami" takes over a second, so the
+ * result is cached briefly. Signing in is picked up
+ * within the cache window.
+ */
+const KIRO_AUTH_CACHE_MS = 15_000;
+
+let kiroAuthCache: {
+    checkedAt: number;
+    signedIn: boolean;
+} | null = null;
+
+export function invalidateKiroAuthCache(): void {
+    kiroAuthCache = null;
+}
+
+function kiroSignedIn(): boolean {
+    const now = Date.now();
+
+    if (
+        kiroAuthCache &&
+        now - kiroAuthCache.checkedAt <
+            KIRO_AUTH_CACHE_MS
+    ) {
+        return kiroAuthCache.signedIn;
+    }
+
+    const result = spawnSync(
+        kiroCli(),
+        ['whoami', '--format', 'json'],
+        {
+            encoding: 'utf8',
+            timeout: 10_000,
+        },
+    );
+
+    let signedIn = false;
+
+    if (result.status === 0) {
+        try {
+            const parsed = JSON.parse(
+                result.stdout,
+            );
+
+            signedIn = Boolean(
+                parsed && parsed.account !== null,
+            );
+        } catch {
+            signedIn = true;
+        }
+    }
+
+    kiroAuthCache = { checkedAt: now, signedIn };
+
+    return signedIn;
 }
 
 const HARNESSES: Record<HarnessId, HarnessDefinition> = {
@@ -106,6 +220,8 @@ const HARNESSES: Record<HarnessId, HarnessDefinition> = {
         description: 'GitHub Copilot CLI via the workspace start script.',
         mcpViaAcp: false,
         supportsMcpListCommand: true,
+        offersDefaultModel: false,
+        signInHint: 'Sign in to the GitHub Copilot CLI in a terminal, then retry.',
 
         launch(workspacePath) {
             return {
@@ -130,13 +246,21 @@ const HARNESSES: Record<HarnessId, HarnessDefinition> = {
         description: 'OpenAI Codex via the codex-acp adapter.',
         mcpViaAcp: true,
         supportsMcpListCommand: false,
+        offersDefaultModel: true,
+        signInHint: 'Use "Sign in" under the harness picker, then retry.',
 
         launch() {
             const override =
                 process.env.AGENT_KITTY_CODEX_ACP;
 
             if (override) {
-                return { command: override, args: [] };
+                return {
+                    command: override,
+                    args: [],
+                    env: {
+                        CODEX_HOME: ensureCodexHome(),
+                    },
+                };
             }
 
             const entry = resolveCodexAcpEntry();
@@ -150,6 +274,9 @@ const HARNESSES: Record<HarnessId, HarnessDefinition> = {
             return {
                 command: process.execPath,
                 args: [entry],
+                env: {
+                    CODEX_HOME: ensureCodexHome(),
+                },
             };
         },
 
@@ -167,7 +294,62 @@ const HARNESSES: Record<HarnessId, HarnessDefinition> = {
             if (!hasCodexCredentials()) {
                 return {
                     available: false,
-                    detail: 'Not signed in. Run "npx codex login" or set OPENAI_API_KEY',
+                    detail: 'Not signed in. Use "Sign in" under the harness picker',
+                };
+            }
+
+            return { available: true };
+        },
+    },
+
+    kiro: {
+        id: 'kiro',
+        label: 'Kiro',
+        description: 'Kiro CLI via "kiro-cli acp".',
+        mcpViaAcp: true,
+        supportsMcpListCommand: false,
+        offersDefaultModel: false,
+        signInHint: 'Use "Sign in" under the harness picker, then retry.',
+
+        launch() {
+            const engine =
+                process.env.AGENT_KITTY_KIRO_ENGINE;
+
+            if (
+                engine &&
+                !KIRO_ENGINES.includes(engine)
+            ) {
+                throw new Error(
+                    `AGENT_KITTY_KIRO_ENGINE must be one of ${KIRO_ENGINES.join(', ')}`,
+                );
+            }
+
+            return {
+                command: kiroCli(),
+                args: [
+                    'acp',
+                    ...(engine
+                        ? ['--agent-engine', engine]
+                        : []),
+                ],
+            };
+        },
+
+        availability() {
+            if (
+                !process.env.AGENT_KITTY_KIRO_CLI &&
+                !commandOnPath('kiro-cli')
+            ) {
+                return {
+                    available: false,
+                    detail: 'kiro-cli not found on PATH',
+                };
+            }
+
+            if (!kiroSignedIn()) {
+                return {
+                    available: false,
+                    detail: 'Not signed in. Use "Sign in" under the harness picker',
                 };
             }
 

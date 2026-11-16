@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 import { WorkspaceAgent } from './WorkspaceAgent.js';
 import {
+    configureHarnessRoot,
     getHarness,
     isHarnessId,
     listHarnesses,
@@ -23,6 +24,33 @@ import {
     toAcpMcpServers,
     type HarnessId,
 } from './harness.js';
+import {
+    cancelCodexLogin,
+    getCodexLogin,
+    logoutCodex,
+    readCodexAccount,
+    startCodexLogin,
+} from './codexAuth.js';
+import {
+    cancelKiroLogin,
+    getKiroLogin,
+    kiroIdentityCenterDefaults,
+    logoutKiro,
+    readKiroAccount,
+    startKiroLogin,
+    validateIdentityCenter,
+} from './kiroAuth.js';
+import {
+    buildHandoff,
+    clearConversation,
+    configureHandoffStore,
+    hasPendingSummary,
+    loadConversation,
+    recordTurn,
+    requestSummary,
+    seedConversation,
+    waitForPendingSummary,
+} from './handoff.js';
 
 
 /*
@@ -56,10 +84,139 @@ const agents =
  * the same one, and the choice persists in
  * .agent-kitty/config.json.
  */
+configureHarnessRoot(
+    COPILOT_ROOT,
+);
+
+configureHandoffStore(
+    COPILOT_ROOT,
+);
+
 let activeHarnessId: HarnessId =
     await loadHarnessId(
         COPILOT_ROOT,
     );
+
+/*
+ * Agents from inactive harnesses stay parked so that
+ * switching back resumes their session. They are
+ * stopped after AGENT_KITTY_PARK_MINUTES idle (0
+ * stops them as soon as any handoff summary is done).
+ */
+const parkedAgents =
+    new Map<
+        HarnessId,
+        Map<string, WorkspaceAgent>
+    >();
+
+const parkTimers =
+    new Map<
+        WorkspaceAgent,
+        NodeJS.Timeout
+    >();
+
+const PARK_MS =
+    Math.max(
+        0,
+        Number(
+            process.env
+                .AGENT_KITTY_PARK_MINUTES ??
+                30,
+        ) || 0,
+    ) * 60_000;
+
+function scheduleParkedStop(
+    harnessId: HarnessId,
+    workspaceId: string,
+    agent: WorkspaceAgent,
+    delayMs: number,
+) {
+    const timer =
+        setTimeout(() => {
+            parkTimers.delete(agent);
+
+            const parked =
+                parkedAgents.get(
+                    harnessId,
+                );
+
+            if (
+                parked?.get(
+                    workspaceId,
+                ) !== agent
+            ) {
+                return;
+            }
+
+            /*
+             * Still writing a handoff summary.
+             */
+            if (agent.isBusy()) {
+                scheduleParkedStop(
+                    harnessId,
+                    workspaceId,
+                    agent,
+                    15_000,
+                );
+
+                return;
+            }
+
+            agent.stop();
+            parked.delete(workspaceId);
+
+            console.log(
+                `Stopped parked ${harnessId} agent for ${workspaceId}`,
+            );
+        }, delayMs);
+
+    timer.unref();
+
+    parkTimers.set(
+        agent,
+        timer,
+    );
+}
+
+function unparkTimer(
+    agent: WorkspaceAgent,
+) {
+    clearTimeout(
+        parkTimers.get(agent),
+    );
+
+    parkTimers.delete(agent);
+}
+
+function stopParkedAgents(
+    filter: (
+        harnessId: HarnessId,
+        workspaceId: string,
+        agent: WorkspaceAgent,
+    ) => boolean,
+) {
+    for (
+        const [harnessId, parked] of
+        parkedAgents
+    ) {
+        for (
+            const [workspaceId, agent] of
+            parked
+        ) {
+            if (
+                filter(
+                    harnessId,
+                    workspaceId,
+                    agent,
+                )
+            ) {
+                unparkTimer(agent);
+                agent.stop();
+                parked.delete(workspaceId);
+            }
+        }
+    }
+}
 
 const execFileAsync =
     promisify(execFile);
@@ -939,12 +1096,19 @@ app.post(
                 return;
             }
 
+            /*
+             * An agent writing a handoff summary is
+             * busy internally, not with user work.
+             */
             const busy =
                 [
-                    ...agents.values(),
+                    ...agents,
                 ].some(
-                    (agent) =>
-                        agent.isBusy(),
+                    ([workspaceId, agent]) =>
+                        agent.isBusy() &&
+                        !hasPendingSummary(
+                            workspaceId,
+                        ),
                 );
 
             if (busy) {
@@ -963,17 +1127,83 @@ app.post(
                 requested,
             );
 
+            const previousHarnessId =
+                activeHarnessId;
+
+            const previousLabel =
+                getHarness(
+                    previousHarnessId,
+                ).label;
+
             activeHarnessId =
                 requested;
 
+            /*
+             * Park the outgoing agents (after asking
+             * each for a handoff summary) and resume
+             * any agents parked on the new harness.
+             */
+            const outgoing =
+                parkedAgents.get(
+                    previousHarnessId,
+                ) ??
+                new Map<
+                    string,
+                    WorkspaceAgent
+                >();
+
             for (
-                const agent of
-                agents.values()
+                const [workspaceId, agent] of
+                agents
             ) {
-                agent.stop();
+                requestSummary(
+                    workspaceId,
+                    agent,
+                    previousLabel,
+                );
+
+                outgoing.set(
+                    workspaceId,
+                    agent,
+                );
+
+                scheduleParkedStop(
+                    previousHarnessId,
+                    workspaceId,
+                    agent,
+                    PARK_MS,
+                );
             }
 
+            parkedAgents.set(
+                previousHarnessId,
+                outgoing,
+            );
+
             agents.clear();
+
+            const resumed =
+                parkedAgents.get(
+                    requested,
+                );
+
+            if (resumed) {
+                for (
+                    const [workspaceId, agent] of
+                    resumed
+                ) {
+                    unparkTimer(agent);
+
+                    agents.set(
+                        workspaceId,
+                        agent,
+                    );
+                }
+
+                parkedAgents.delete(
+                    requested,
+                );
+            }
 
             console.log(
                 `Harness switched to ${requested}`,
@@ -1000,6 +1230,349 @@ app.post(
     },
 );
 
+
+/*
+ * --------------------------------------------------------------------------
+ * Codex account (Agent Kitty's own CODEX_HOME)
+ * --------------------------------------------------------------------------
+ */
+
+/*
+ * Idle agents on a harness restart so their next
+ * session uses the new credentials.
+ */
+function restartIdleAgents(target: HarnessId) {
+    stopParkedAgents(
+        (harnessId, _workspaceId, agent) =>
+            harnessId === target &&
+            !agent.isBusy(),
+    );
+
+    if (activeHarnessId !== target) {
+        return;
+    }
+
+    for (const [id, agent] of agents) {
+        if (!agent.isBusy()) {
+            agent.stop();
+            agents.delete(id);
+        }
+    }
+}
+
+async function codexAuthResponse() {
+    return {
+        account:
+            await readCodexAccount(),
+        login:
+            getCodexLogin(),
+    };
+}
+
+app.get(
+    '/api/harness/codex/auth',
+    async (_req, res) => {
+        try {
+            res.json(
+                await codexAuthResponse(),
+            );
+        } catch (error) {
+            res.status(
+                500,
+            ).json({
+                error:
+                    errorMessage(
+                        error,
+                        'Unable to read Codex account',
+                    ),
+            });
+        }
+    },
+);
+
+app.post(
+    '/api/harness/codex/login',
+    async (req, res) => {
+        try {
+            const mode =
+                req.body?.mode === 'browser'
+                    ? 'browser'
+                    : 'device';
+
+            await startCodexLogin(
+                mode,
+                (login) => {
+                    console.log(
+                        `Codex sign-in ${login.status}`,
+                    );
+
+                    if (
+                        login.status ===
+                        'succeeded'
+                    ) {
+                        restartIdleAgents('codex');
+                    }
+                },
+            );
+
+            res.json(
+                await codexAuthResponse(),
+            );
+        } catch (error) {
+            console.error(
+                error,
+            );
+
+            res.status(
+                500,
+            ).json({
+                error:
+                    errorMessage(
+                        error,
+                        'Unable to start Codex sign-in',
+                    ),
+            });
+        }
+    },
+);
+
+app.post(
+    '/api/harness/codex/login/cancel',
+    async (_req, res) => {
+        cancelCodexLogin();
+
+        res.json(
+            await codexAuthResponse(),
+        );
+    },
+);
+
+app.post(
+    '/api/harness/codex/logout',
+    async (_req, res) => {
+        try {
+            if (
+                activeHarnessId ===
+                    'codex' &&
+                [
+                    ...agents.values(),
+                ].some(
+                    (agent) =>
+                        agent.isBusy(),
+                )
+            ) {
+                res.status(
+                    409,
+                ).json({
+                    error:
+                        'An agent is still working. Wait for it to finish before signing out.',
+                });
+
+                return;
+            }
+
+            await logoutCodex();
+
+            restartIdleAgents('codex');
+
+            console.log(
+                'Codex signed out',
+            );
+
+            res.json(
+                await codexAuthResponse(),
+            );
+        } catch (error) {
+            console.error(
+                error,
+            );
+
+            res.status(
+                500,
+            ).json({
+                error:
+                    errorMessage(
+                        error,
+                        'Unable to sign out of Codex',
+                    ),
+            });
+        }
+    },
+);
+
+
+/*
+ * --------------------------------------------------------------------------
+ * Kiro account (the user's kiro-cli login)
+ * --------------------------------------------------------------------------
+ */
+
+async function kiroAuthResponse() {
+    return {
+        account:
+            await readKiroAccount(),
+        login:
+            getKiroLogin(),
+        identityCenterDefaults:
+            kiroIdentityCenterDefaults(),
+    };
+}
+
+function kiroAgentBusy(): boolean {
+    return (
+        activeHarnessId === 'kiro' &&
+        [
+            ...agents.values(),
+        ].some(
+            (agent) =>
+                agent.isBusy(),
+        )
+    );
+}
+
+app.get(
+    '/api/harness/kiro/auth',
+    async (_req, res) => {
+        try {
+            res.json(
+                await kiroAuthResponse(),
+            );
+        } catch (error) {
+            res.status(
+                500,
+            ).json({
+                error:
+                    errorMessage(
+                        error,
+                        'Unable to read Kiro account',
+                    ),
+            });
+        }
+    },
+);
+
+app.post(
+    '/api/harness/kiro/login',
+    async (req, res) => {
+        try {
+            if (
+                kiroAgentBusy()
+            ) {
+                res.status(
+                    409,
+                ).json({
+                    error:
+                        'An agent is still working. Wait for it to finish before signing in.',
+                });
+
+                return;
+            }
+
+            const mode =
+                req.body?.mode === 'device'
+                    ? 'device'
+                    : 'browser';
+
+            const identityCenter =
+                validateIdentityCenter(
+                    req.body
+                        ?.identityCenter,
+                );
+
+            await startKiroLogin(
+                mode,
+                identityCenter,
+                (login) => {
+                    console.log(
+                        `Kiro sign-in ${login.status}`,
+                    );
+
+                    if (
+                        login.status ===
+                        'succeeded'
+                    ) {
+                        restartIdleAgents('kiro');
+                    }
+                },
+            );
+
+            res.json(
+                await kiroAuthResponse(),
+            );
+        } catch (error) {
+            console.error(
+                error,
+            );
+
+            res.status(
+                400,
+            ).json({
+                error:
+                    errorMessage(
+                        error,
+                        'Unable to start Kiro sign-in',
+                    ),
+            });
+        }
+    },
+);
+
+app.post(
+    '/api/harness/kiro/login/cancel',
+    async (_req, res) => {
+        cancelKiroLogin();
+
+        res.json(
+            await kiroAuthResponse(),
+        );
+    },
+);
+
+app.post(
+    '/api/harness/kiro/logout',
+    async (_req, res) => {
+        try {
+            if (
+                kiroAgentBusy()
+            ) {
+                res.status(
+                    409,
+                ).json({
+                    error:
+                        'An agent is still working. Wait for it to finish before signing out.',
+                });
+
+                return;
+            }
+
+            await logoutKiro();
+
+            restartIdleAgents('kiro');
+
+            console.log(
+                'Kiro signed out',
+            );
+
+            res.json(
+                await kiroAuthResponse(),
+            );
+        } catch (error) {
+            console.error(
+                error,
+            );
+
+            res.status(
+                500,
+            ).json({
+                error:
+                    errorMessage(
+                        error,
+                        'Unable to sign out of Kiro',
+                    ),
+            });
+        }
+    },
+);
 
 /*
  * --------------------------------------------------------------------------
@@ -1061,6 +1634,55 @@ app.get(
  * Prompt
  * --------------------------------------------------------------------------
  */
+
+/*
+ * Browser-held chat history, sent as a JSON form
+ * field so a conversation that predates the saved
+ * transcript can still be replayed after a restart.
+ */
+const HISTORY_TURN_LIMIT = 12;
+const HISTORY_TEXT_LIMIT = 4_000;
+
+function parseHistory(
+    raw: unknown,
+): { user: string; assistant: string }[] {
+    if (typeof raw !== 'string' || !raw) {
+        return [];
+    }
+
+    try {
+        const parsed: unknown = JSON.parse(raw);
+
+        if (!Array.isArray(parsed)) {
+            return [];
+        }
+
+        return parsed
+            .filter(
+                (turn): turn is {
+                    user: string;
+                    assistant: string;
+                } =>
+                    Boolean(turn) &&
+                    typeof turn.user === 'string' &&
+                    typeof turn.assistant ===
+                        'string',
+            )
+            .slice(-HISTORY_TURN_LIMIT)
+            .map((turn) => ({
+                user: turn.user.slice(
+                    0,
+                    HISTORY_TEXT_LIMIT,
+                ),
+                assistant: turn.assistant.slice(
+                    0,
+                    HISTORY_TEXT_LIMIT,
+                ),
+            }));
+    } catch {
+        return [];
+    }
+}
 
 app.post(
     '/api/workspaces/:id/prompt',
@@ -1176,9 +1798,63 @@ app.post(
                 );
             };
 
+            /*
+             * After a restart the transcript is only
+             * on disk; load it so the new session is
+             * given the conversation the user can see.
+             */
+            await loadConversation(
+                id,
+            );
+
+            seedConversation(
+                id,
+                agent.harnessLabel,
+                parseHistory(
+                    req.body?.history,
+                ),
+            );
+
+            /*
+             * A handoff summary may still be running,
+             * possibly on this very agent if the user
+             * switched straight back.
+             */
+            await waitForPendingSummary(
+                id,
+            );
+
+            const handoff =
+                buildHandoff(
+                    id,
+                    agent,
+                );
+
+            if (handoff) {
+                console.log(
+                    `[handoff] ${workspace.name}: ${handoff.mode} from ${handoff.from.join(', ')}`,
+                );
+
+                send({
+                    type:
+                        'handoff',
+
+                    from:
+                        handoff.from,
+
+                    mode:
+                        handoff.mode,
+
+                    reason:
+                        handoff.reason,
+                });
+            }
+
             const result =
                 await agent.prompt(
-                    agentPrompt,
+                    handoff
+                        ? `${handoff.text}\n\n## New user message\n${agentPrompt}`
+                        : agentPrompt,
                     {
                         onChunk:
                             (
@@ -1219,14 +1895,34 @@ app.post(
                     },
                 );
 
-            send({
-                type: 'done',
+                recordTurn(
+                    id,
+                    agent,
+                    {
+                        harnessLabel:
+                            agent.harnessLabel,
+
+                        user:
+                            attachments.length > 0
+                                ? `${prompt.trim()}\n[Attached: ${attachments.map((file) => file.originalname).join(', ')}]`
+                                : prompt.trim(),
+
+                        assistant:
+                            result.response,
+                    },
+                );
+
+                send({
+                    type: 'done',
 
                 stopReason:
                     result.stopReason,
 
                 sessionId:
                     result.sessionId,
+
+                usage:
+                    result.usage,
             });
 
             res.end();
@@ -2079,6 +2775,17 @@ app.post(
              * reset. Its first prompt will naturally
              * create a fresh conversation.
              */
+            await waitForPendingSummary(
+                id,
+            );
+
+            clearConversation(id);
+
+            stopParkedAgents(
+                (_harnessId, workspaceId) =>
+                    workspaceId === id,
+            );
+
             const agent =
                 agents.get(id);
 

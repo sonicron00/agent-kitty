@@ -18,7 +18,6 @@ import {
     readFileSync,
 } from 'node:fs';
 
-import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -953,11 +952,17 @@ Prerequisites
             : 'Run "npm install" in the agent-kitty package',
     );
 
+    /*
+     * Agent Kitty keeps its own Codex login,
+     * separate from ~/.codex.
+     */
     const codexHome =
-        process.env.CODEX_HOME ??
+        process.env
+            .AGENT_KITTY_CODEX_HOME ??
         path.join(
-            os.homedir(),
-            '.codex',
+            workspaceRoot,
+            '.agent-kitty',
+            'codex',
         );
 
     const codexSignedIn =
@@ -977,9 +982,60 @@ Prerequisites
         codexSignedIn,
         'Codex authentication',
         codexSignedIn
-            ? ''
-            : 'Run "npx codex login" or set OPENAI_API_KEY',
+            ? codexHome
+            : `Use "Sign in" under the harness picker (credentials in ${codexHome})`,
     );
+
+    const kiroCli =
+        process.env
+            .AGENT_KITTY_KIRO_CLI ??
+        'kiro-cli';
+
+    const kiro =
+        commandExists(
+            kiroCli,
+        );
+
+    printCheck(
+        kiro.available,
+        'Kiro CLI',
+        kiro.available
+            ? kiro.output
+            : 'Install Kiro CLI (https://kiro.dev/docs/cli/) for the Kiro harness',
+    );
+
+    if (kiro.available) {
+        const whoami =
+            spawnSync(
+                kiroCli,
+                [
+                    'whoami',
+                ],
+                {
+                    encoding:
+                        'utf8',
+
+                    stdio: [
+                        'ignore',
+                        'pipe',
+                        'pipe',
+                    ],
+                },
+            );
+
+        const kiroSignedIn =
+            whoami.status === 0;
+
+        printCheck(
+            kiroSignedIn,
+            'Kiro authentication',
+            kiroSignedIn
+                ? (whoami.stdout ?? '')
+                      .trim()
+                      .split('\n')[0] ?? ''
+                : 'Use "Sign in" under the harness picker, or run "kiro-cli login"',
+        );
+    }
 
     /*
      * Agent Kitty root

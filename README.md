@@ -2,7 +2,7 @@
 
 Agent Kitty is a local browser interface for running coding agents across groups of related repositories.
 
-Agent Kitty can run on more than one agent **harness**: GitHub Copilot CLI (default) or OpenAI Codex. Switch between them from the **Harness** selector in the sidebar; the choice applies to every agent and is remembered between restarts. See [Harnesses](#harnesses).
+Agent Kitty can run on more than one agent **harness**: GitHub Copilot CLI (default), OpenAI Codex or Kiro CLI. Switch between them from the **Harness** selector in the sidebar; the choice applies to every agent and is remembered between restarts. See [Harnesses](#harnesses).
 
 Instead of opening one repository at a time, Agent Kitty lets you create an **agent workspace** containing several repositories that belong together. Each agent gets its own instructions, MCP configuration, agent session, model selection, reasoning setting, conversation history, and tool activity.
 
@@ -12,12 +12,14 @@ Instead of opening one repository at a time, Agent Kitty lets you create an **ag
 
 Agent Kitty gives you:
 
-- A browser UI for GitHub Copilot and OpenAI Codex coding agents
+- A browser UI for GitHub Copilot, OpenAI Codex and Kiro coding agents
 - One-click harness switching across all agents
 - Multiple independent agents in one interface
 - Support for grouping related repositories together
 - Streaming responses
 - Tool activity visibility
+- Per-response usage (tokens, context window, duration) for every harness. Kiro reports no token counts, so it shows context percentage and credits used instead
+- Resizable message box (drag its top edge, double-click to reset)
 - Markdown and syntax-highlighted code
 - File attachments
 - Model selection
@@ -243,6 +245,7 @@ Agent Kitty currently expects:
 - zsh
 - GitHub Copilot CLI and authentication (for the Copilot harness)
 - OpenAI Codex authentication (for the Codex harness; the adapter is bundled)
+- Kiro CLI and authentication (for the Kiro harness)
 - `npx`
 - `uv` if using the bundled Lenses MCP
 
@@ -270,6 +273,8 @@ Harnesses
 
 ✓ Codex ACP adapter
 ✓ Codex authentication
+✓ Kiro CLI
+✓ Kiro authentication
 
 Agent Kitty setup
 
@@ -1135,13 +1140,7 @@ agent-kitty doctor
 
 Codex needs to reach `chatgpt.com` (ChatGPT sign-in) or `api.openai.com` (API key). A corporate proxy, VPN or firewall that blocks these shows as "workspace routing discovery failed" in the chat.
 
-Sign in with:
-
-```bash
-npx codex login
-```
-
-or export `OPENAI_API_KEY` before `agent-kitty start`.
+Sign in from the **Codex account** panel in the collapsible **Sign-ins** section under the harness picker (see [Codex account](#codex-account)), or export `OPENAI_API_KEY` before `agent-kitty start`.
 
 ---
 
@@ -1153,17 +1152,27 @@ A harness is the coding agent runtime behind every agent. Agent Kitty talks to e
 |---|---|---|
 | GitHub Copilot (default) | The workspace `start` script (`copilot --acp --stdio`) | Loaded by Copilot from `--additional-mcp-config` |
 | OpenAI Codex | Bundled `@agentclientprotocol/codex-acp` adapter | Shared and workspace `mcp.json` passed over ACP |
+| Kiro | `kiro-cli acp` from your Kiro CLI install | Shared and workspace `mcp.json` passed over ACP |
 
 Switching harness:
 
 - Use the **Harness** selector in the sidebar. It is disabled while any agent is working.
-- Every running agent process is stopped and restarts on the new harness at its next request. Conversation history in the UI is kept, but the new harness starts a fresh session without the previous context.
-- The choice is saved as `"harness"` in `.agent-kitty/config.json`. `AGENT_KITTY_HARNESS=codex agent-kitty start` overrides it for one run.
+- The choice is saved as `"harness"` in `.agent-kitty/config.json`. `AGENT_KITTY_HARNESS=codex agent-kitty start` overrides it for one run (`copilot`, `codex` or `kiro`).
+
+Context carries across a switch:
+
+- Outgoing agents are **parked**, not stopped. Switching back resumes the same session with its full context. Parked agents stop after 30 idle minutes; set `AGENT_KITTY_PARK_MINUTES` to change this (`0` stops them as soon as their handoff summary is written).
+- On a switch, each outgoing agent writes a short **handoff summary** in the background (goal, decisions, files changed, next steps).
+- On its first prompt, the next agent receives a hidden handoff block: the latest summary plus the recent turns it has not seen, verbatim. If no summary is available, it falls back to the recent transcript. The response shows "Context carried over from ..." when this happens.
+- Internal state such as cached file reads and tool results cannot move between harnesses, so the new agent is told to check files before relying on the handoff.
+- The transcript and latest summary are saved to `<root>/.agent-kitty/conversations/<workspace>.json`, so they survive a restart. Agents always start a new session, so after a restart the first prompt in each workspace replays the saved conversation and the response shows "Earlier conversation restored after restart". Chats from before this file existed are seeded from the history the browser still holds (last 12 turns).
+- **New chat** clears the handoff transcript, deletes the saved file and stops that workspace's parked agents.
 - Model choices are remembered per harness.
 
 Codex notes:
 
 - Codex reads `AGENTS.md` from the workspace directory natively.
+- The model picker starts on **Default (OpenAI Codex recommended: ...)**, the model Codex chooses for each new session. Picking a specific model pins it for that workspace; pick **Default** again to go back to following Codex's recommendation.
 - Relative MCP commands such as `../.agent-kitty/shared/bin/lenses-mcp` are resolved against the workspace directory.
 - The MCPs tab shows Codex servers as `configured`, because Codex has no parseable `/mcp list` equivalent over ACP.
 - To withhold MCP servers from a harness, list them in `.agent-kitty/config.json`. They show as `disabled` in the MCPs tab and apply from the next agent start (switch harness or restart Agent Kitty):
@@ -1177,8 +1186,37 @@ Codex notes:
   }
   ```
 
-  This only affects harnesses that receive MCP servers over ACP (Codex). Copilot loads `mcp.json` itself.
+  This only affects harnesses that receive MCP servers over ACP (Codex and Kiro). Copilot loads `mcp.json` itself.
 - Set `AGENT_KITTY_CODEX_ACP` to use a different `codex-acp` executable.
+
+Kiro notes:
+
+- Kiro uses your normal Kiro CLI login, so signing in here also signs in `kiro-cli` in your terminal (and the reverse). Sign in from the **Kiro account** panel in the collapsible **Sign-ins** section under the harness picker; no terminal is needed:
+  - **Sign in** opens Kiro's sign-in page in your default browser, where you choose Google, GitHub or AWS Builder ID.
+  - **Code** uses AWS Builder ID with a one-time code, for signing in from a different browser profile.
+  - Tick **Identity Center (Kiro Pro)** and enter your start URL and region to sign in through your organisation's IAM Identity Center instead. Both buttons then use Identity Center. The values are remembered in the browser.
+  - To prefill Identity Center for a team, set `AGENT_KITTY_KIRO_START_URL` and `AGENT_KITTY_KIRO_REGION`.
+  - **Switch account** signs `kiro-cli` out first, because it will not log in over an existing session.
+- The harness cannot be selected while signed out. Signing in from a terminal with `kiro-cli login` still works and is picked up within about 15 seconds.
+- Kiro reads `AGENTS.md` from the workspace directory natively, along with any `.kiro/steering` files.
+- The model picker lists the models Kiro offers for the session (including Kiro's own `auto`). Both the Kiro CLI v2 engine (`session/set_model`) and the V3 engine (config options, including effort level) are supported.
+- `kiro-cli acp` uses its default engine, or the `acp.agentEngine` Kiro setting. Set `AGENT_KITTY_KIRO_ENGINE` to `v1`, `v2` or `v3` to pass `--agent-engine` explicitly.
+- The MCPs tab shows Kiro servers as `configured`. Kiro also loads MCP servers from its own `~/.kiro/settings/mcp.json` and workspace `.kiro/settings/mcp.json`; disable duplicates there or with `disabledMcpServers.kiro`.
+- Set `AGENT_KITTY_KIRO_CLI` to use a different `kiro-cli` executable.
+
+### Codex account
+
+Agent Kitty keeps its own Codex login in `.agent-kitty/codex` under the workspace root (passed to Codex as `CODEX_HOME`). It never reads or changes your personal `~/.codex` login, so Agent Kitty can use a work ChatGPT account while the Codex CLI or app uses a personal one.
+
+The **Codex account** panel, in the collapsible **Sign-ins** section under the harness picker, shows the signed-in email, plan and workspace:
+
+- **Sign in** / **Switch account** starts a device-code sign-in. Open the link in the browser profile signed in to the account you want and enter the one-time code. Business and Enterprise workspaces may need an admin to allow device-code sign-in; use **Browser** if it is blocked.
+- **Browser** opens the ChatGPT sign-in page in your default browser. The link is also shown so you can open it in another profile.
+- **Sign out** removes Agent Kitty's Codex credentials only.
+
+Idle Codex agents restart after a sign-in or sign-out so their next session uses the new account. The Codex harness cannot be selected until Agent Kitty is signed in. Agent Kitty's `CODEX_HOME` has no `config.toml` by default; add one there for Codex-specific settings.
+
+Set `AGENT_KITTY_CODEX_HOME` to use a different location, for example `AGENT_KITTY_CODEX_HOME=~/.codex` to share the personal login.
 
 ---
 
@@ -1240,7 +1278,7 @@ Agent Kitty Node backend
    ↓
 Agent Client Protocol
    ↓
-Harness: GitHub Copilot CLI or OpenAI Codex (codex-acp)
+Harness: GitHub Copilot CLI, OpenAI Codex (codex-acp) or Kiro CLI (kiro-cli acp)
    ↓
 Repositories + AGENTS.md + MCP servers
 ```
